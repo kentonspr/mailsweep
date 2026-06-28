@@ -594,43 +594,60 @@ impl App {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = setup()?;
+    let (client, cache) = setup()?;
     let (tx, rx) = mpsc::unbounded_channel();
     let scan_client = client.clone();
     let scan_tx = tx.clone();
-    tokio::spawn(async move { run_scan(scan_client, scan_tx).await });
+    tokio::spawn(async move { run_scan(scan_client, cache, scan_tx).await });
     run(client, rx, tx).await
 }
 
-fn setup() -> Result<GmailClient> {
+fn setup() -> Result<(GmailClient, Cache)> {
     let auth = GmailAuth::new(config::secret_path(), config::token_cache_path(), config::SCOPES);
     let cache = Cache::open(config::cache_path())?;
-    Ok(GmailClient::new(Arc::new(auth)).with_cache(cache))
+    let client = GmailClient::new(Arc::new(auth)).with_cache(cache.clone());
+    Ok((client, cache))
 }
 
-async fn run_scan(client: GmailClient, tx: UnboundedSender<ScanEvent>) {
+async fn run_scan(client: GmailClient, cache: Cache, tx: UnboundedSender<ScanEvent>) {
     let _ = tx.send(ScanEvent::Status("Authenticating…".to_string()));
-    match client.profile().await {
+    let profile = match client.profile().await {
         Ok(p) => {
-            let _ = tx.send(ScanEvent::Account(p));
+            let _ = tx.send(ScanEvent::Account(p.clone()));
+            p
         }
-        Err(e) => {
-            let _ = tx.send(ScanEvent::Failed(e.to_string()));
-            return;
-        }
-    }
-
-    let limit = config::scan_limit();
-    let _ = tx.send(ScanEvent::Status("Listing inbox…".to_string()));
-    let ids = match client.list_message_ids(Some("in:inbox"), limit).await {
-        Ok(v) => v,
         Err(e) => {
             let _ = tx.send(ScanEvent::Failed(e.to_string()));
             return;
         }
     };
-    let _ = tx.send(ScanEvent::Listed(ids.len()));
 
+    // Metadata: incremental sync from the stored checkpoint if possible,
+    // otherwise a full inbox scan.
+    let mut did_incremental = false;
+    if let Ok(Some(start)) = cache.get_state("history_id").await {
+        match sync_incremental(&client, &cache, &tx, &start).await {
+            Ok(true) => did_incremental = true,
+            Ok(false) => {} // history expired → full sync
+            Err(e) => {
+                let _ = tx.send(ScanEvent::Status(format!(
+                    "Incremental sync failed ({e}); doing full sync"
+                )));
+            }
+        }
+    }
+    if !did_incremental {
+        if let Err(e) = sync_full(&client, &tx).await {
+            let _ = tx.send(ScanEvent::Failed(e.to_string()));
+            return;
+        }
+    }
+    // Save the checkpoint captured at the start of this run (so anything that
+    // changed during the sync is picked up next time).
+    let _ = cache.set_state("history_id", &profile.history_id).await;
+
+    // Attachments view data + background actual sizes (shared by both paths).
+    let limit = config::scan_limit();
     let attachment_ids = client
         .list_message_ids(Some("in:inbox has:attachment"), limit)
         .await
@@ -639,34 +656,6 @@ async fn run_scan(client: GmailClient, tx: UnboundedSender<ScanEvent>) {
         attachment_ids.iter().cloned().collect(),
     ));
 
-    let progress_tx = tx.clone();
-    let report = client
-        .fetch_metadata_with(&ids, |p: FetchProgress, batch: &[MessageMeta]| {
-            let _ = progress_tx.send(ScanEvent::Progress {
-                resolved: p.resolved,
-                total: p.total,
-                metas: batch.to_vec(),
-            });
-        })
-        .await;
-    let report = match report {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = tx.send(ScanEvent::Failed(e.to_string()));
-            return;
-        }
-    };
-
-    let resolved = report.from_cache + report.fetched;
-    let mut summary = format!("Synced · {resolved}/{} resolved", report.requested);
-    if !report.batch_errors.is_empty() {
-        summary.push_str(&format!(" · ⚠ {}", report.batch_errors[0]));
-    }
-    let _ = tx.send(ScanEvent::Done(summary));
-
-    // Background: fetch actual attachment filenames/sizes for every attachment
-    // message, paced to stay well under quota. Sizes fill in the Attachments
-    // view (and make Enter instant) as they arrive.
     let total = attachment_ids.len();
     for (i, id) in attachment_ids.into_iter().enumerate() {
         if let Ok(list) = client.message_attachments(&id).await {
@@ -685,6 +674,93 @@ async fn run_scan(client: GmailClient, tx: UnboundedSender<ScanEvent>) {
             "Attachment sizes loaded ({total} messages)"
         )));
     }
+}
+
+/// Full inbox scan: list every message, fetch metadata (cache-aware).
+async fn sync_full(client: &GmailClient, tx: &UnboundedSender<ScanEvent>) -> Result<()> {
+    let limit = config::scan_limit();
+    let _ = tx.send(ScanEvent::Status("Listing inbox…".to_string()));
+    let ids = client.list_message_ids(Some("in:inbox"), limit).await?;
+    let _ = tx.send(ScanEvent::Listed(ids.len()));
+
+    let ptx = tx.clone();
+    let report = client
+        .fetch_metadata_with(&ids, |p: FetchProgress, batch: &[MessageMeta]| {
+            let _ = ptx.send(ScanEvent::Progress {
+                resolved: p.resolved,
+                total: p.total,
+                metas: batch.to_vec(),
+            });
+        })
+        .await?;
+
+    let resolved = report.from_cache + report.fetched;
+    let mut summary = format!("Synced · {resolved}/{} resolved", report.requested);
+    if !report.batch_errors.is_empty() {
+        summary.push_str(&format!(" · ⚠ {}", report.batch_errors[0]));
+    }
+    let _ = tx.send(ScanEvent::Done(summary));
+    Ok(())
+}
+
+/// Incremental sync: rebuild the current inbox from the cache plus the
+/// adds/removes since `start`. Returns `Ok(false)` if the history expired.
+async fn sync_incremental(
+    client: &GmailClient,
+    cache: &Cache,
+    tx: &UnboundedSender<ScanEvent>,
+    start: &str,
+) -> Result<bool> {
+    let delta = match client.history_since(start).await? {
+        Some(d) => d,
+        None => return Ok(false),
+    };
+    let _ = tx.send(ScanEvent::Status("Incremental sync…".to_string()));
+
+    let mut base = cache.all().await.unwrap_or_default();
+    let removed_n = delta.removed.len();
+    if removed_n > 0 {
+        let _ = cache.remove(&delta.removed).await;
+        let rem: HashSet<&str> = delta.removed.iter().map(String::as_str).collect();
+        base.retain(|m| !rem.contains(m.id.as_str()));
+    }
+
+    let have: HashSet<&str> = base.iter().map(|m| m.id.as_str()).collect();
+    let to_fetch: Vec<String> = delta
+        .added
+        .iter()
+        .filter(|id| !have.contains(id.as_str()))
+        .cloned()
+        .collect();
+    drop(have);
+
+    let base_n = base.len();
+    let fetch_n = to_fetch.len();
+
+    // Show the cached set instantly, then stream in the new messages.
+    let _ = tx.send(ScanEvent::Progress {
+        resolved: base_n,
+        total: base_n + fetch_n,
+        metas: base,
+    });
+
+    if fetch_n > 0 {
+        let ptx = tx.clone();
+        client
+            .fetch_metadata_with(&to_fetch, |p: FetchProgress, batch: &[MessageMeta]| {
+                let _ = ptx.send(ScanEvent::Progress {
+                    resolved: base_n + p.resolved,
+                    total: base_n + fetch_n,
+                    metas: batch.to_vec(),
+                });
+            })
+            .await?;
+    }
+
+    let _ = tx.send(ScanEvent::Done(format!(
+        "Incremental · {base_n} cached · {fetch_n} new · {removed_n} removed"
+    )));
+    Ok(true)
 }
 
 async fn run(

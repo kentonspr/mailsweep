@@ -76,6 +76,17 @@ pub struct Profile {
     pub email: String,
     pub messages_total: u64,
     pub threads_total: u64,
+    /// Mailbox history checkpoint, for incremental sync.
+    pub history_id: String,
+}
+
+/// Inbox changes since a stored `historyId`, from `users.history.list`.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryDelta {
+    /// Message IDs added to the inbox (new mail, or moved back in).
+    pub added: Vec<String>,
+    /// Message IDs removed from the inbox (deleted, trashed, or archived).
+    pub removed: Vec<String>,
 }
 
 impl GmailClient {
@@ -314,7 +325,79 @@ impl GmailClient {
             email: resp.email_address,
             messages_total: resp.messages_total,
             threads_total: resp.threads_total,
+            history_id: resp.history_id,
         })
+    }
+
+    /// Fetch inbox changes since `start_history_id`.
+    ///
+    /// Returns `Ok(None)` if the history is too old to use (Gmail expires it
+    /// after roughly a week) — the caller should fall back to a full sync.
+    pub async fn history_since(&self, start_history_id: &str) -> Result<Option<HistoryDelta>> {
+        let bearer = self.bearer().await?;
+        let mut added: HashSet<String> = HashSet::new();
+        let mut removed: HashSet<String> = HashSet::new();
+        let mut page: Option<String> = None;
+
+        loop {
+            let mut req = self
+                .http
+                .get(format!("{BASE}/history"))
+                .header("Authorization", &bearer)
+                .query(&[
+                    ("startHistoryId", start_history_id),
+                    ("labelId", "INBOX"),
+                    ("historyTypes", "messageAdded"),
+                    ("historyTypes", "messageDeleted"),
+                    ("historyTypes", "labelAdded"),
+                    ("historyTypes", "labelRemoved"),
+                    ("maxResults", "500"),
+                ]);
+            if let Some(ref token) = page {
+                req = req.query(&[("pageToken", token.as_str())]);
+            }
+
+            let resp = req.send().await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None); // history expired
+            }
+            let resp: HistoryResp = resp.error_for_status()?.json().await?;
+
+            for record in resp.history {
+                for m in record.messages_added {
+                    if m.message.label_ids.iter().any(|l| l == "INBOX") {
+                        removed.remove(&m.message.id);
+                        added.insert(m.message.id);
+                    }
+                }
+                for m in record.messages_deleted {
+                    added.remove(&m.message.id);
+                    removed.insert(m.message.id);
+                }
+                for l in record.labels_added {
+                    if l.label_ids.iter().any(|x| x == "INBOX") {
+                        removed.remove(&l.message.id);
+                        added.insert(l.message.id);
+                    }
+                }
+                for l in record.labels_removed {
+                    if l.label_ids.iter().any(|x| x == "INBOX") {
+                        added.remove(&l.message.id);
+                        removed.insert(l.message.id);
+                    }
+                }
+            }
+
+            match resp.next_page_token {
+                Some(token) => page = Some(token),
+                None => break,
+            }
+        }
+
+        Ok(Some(HistoryDelta {
+            added: added.into_iter().collect(),
+            removed: removed.into_iter().collect(),
+        }))
     }
 
     /// List a message's attachments (filename, type, size, download handle).
@@ -579,6 +662,51 @@ struct ProfileResp {
     messages_total: u64,
     #[serde(default)]
     threads_total: u64,
+    #[serde(default)]
+    history_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryResp {
+    #[serde(default)]
+    history: Vec<HistoryRecord>,
+    #[serde(default)]
+    next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryRecord {
+    #[serde(default)]
+    messages_added: Vec<MessageChanged>,
+    #[serde(default)]
+    messages_deleted: Vec<MessageChanged>,
+    #[serde(default)]
+    labels_added: Vec<LabelChanged>,
+    #[serde(default)]
+    labels_removed: Vec<LabelChanged>,
+}
+
+#[derive(Deserialize)]
+struct MessageChanged {
+    message: HistMessage,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LabelChanged {
+    message: HistMessage,
+    #[serde(default)]
+    label_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistMessage {
+    id: String,
+    #[serde(default)]
+    label_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]

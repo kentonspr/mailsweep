@@ -36,7 +36,9 @@ impl Cache {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
         if version != SCHEMA_VERSION {
-            conn.execute_batch("DROP TABLE IF EXISTS messages;")
+            // Drop messages AND state together: a stale history checkpoint with
+            // an empty message table would yield a near-empty incremental sync.
+            conn.execute_batch("DROP TABLE IF EXISTS messages; DROP TABLE IF EXISTS state;")
                 .context("resetting outdated cache")?;
         }
 
@@ -51,6 +53,10 @@ impl Cache {
                 internal_date         INTEGER NOT NULL DEFAULT 0,
                 list_unsubscribe      TEXT,
                 list_unsubscribe_post TEXT
+            );
+            CREATE TABLE IF NOT EXISTS state (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );",
         )
         .context("initializing cache schema")?;
@@ -59,6 +65,72 @@ impl Cache {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Load every cached message (used as the base set for incremental sync).
+    pub async fn all(&self) -> Result<Vec<MessageMeta>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<MessageMeta>> {
+            let conn = conn.lock().expect("cache mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT id, thread_id, from_name, from_email, subject,
+                        size_estimate, internal_date,
+                        list_unsubscribe, list_unsubscribe_post
+                 FROM messages",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(MessageMeta {
+                    id: r.get(0)?,
+                    thread_id: r.get(1)?,
+                    from_name: r.get(2)?,
+                    from_email: r.get(3)?,
+                    subject: r.get(4)?,
+                    size_estimate: r.get(5)?,
+                    internal_date: r.get(6)?,
+                    list_unsubscribe: r.get(7)?,
+                    list_unsubscribe_post: r.get(8)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    /// Read a value from the key/value state table.
+    pub async fn get_state(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = conn.lock().expect("cache mutex poisoned");
+            match conn.query_row("SELECT value FROM state WHERE key = ?1", params![key], |r| {
+                r.get::<_, String>(0)
+            }) {
+                Ok(v) => Ok(Some(v)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await?
+    }
+
+    /// Write a value to the key/value state table.
+    pub async fn set_state(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let value = value.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.lock().expect("cache mutex poisoned");
+            conn.execute(
+                "INSERT OR REPLACE INTO state (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )?;
+            Ok(())
+        })
+        .await?
     }
 
     /// Look up cached metadata for the given IDs (missing IDs are simply absent).

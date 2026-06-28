@@ -93,8 +93,11 @@ describing every archived message and attachment.
 ## Notes / next steps
 
 - The scan covers the **whole inbox** by default. Set `MAILSWEEP_SCAN_LIMIT=N`
-  to cap it at N messages (e.g. for a quick look at a huge mailbox). The cache
-  makes repeated scans cheap, and the UI populates incrementally as messages
-  arrive.
+  to cap it at N messages (e.g. for a quick look at a huge mailbox).
+- After the first full sync, a `historyId` checkpoint is stored in the cache and
+  subsequent runs do an **incremental sync** (`users.history.list`) — only the
+  adds/removes since last time, rebuilt from the cache, with no full re-listing.
+  If the history has expired (Gmail keeps ~1 week) it transparently falls back
+  to a full sync.
 - Multi-account and multi-provider support (Outlook via Microsoft Graph, Yahoo
   via IMAP) hang off the `MailProvider` trait in `core/src/provider.rs`.
