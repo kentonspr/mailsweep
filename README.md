@@ -52,12 +52,21 @@ First launch opens a browser for consent; the token is cached to
 - `1`/`2`/`3` — focus the Accounts / Domains / Details panel
 - `Tab` / `Shift-Tab` — switch domain view (All / Subscriptions / Attachments)
 - `j`/`k` (or `↑`/`↓`) — move within the focused panel (or scroll Details)
-- `h`/`l` (or `←`/`→`) — collapse / expand a domain into its individual senders
-- `d` trash · `s` mark spam · `u` unsubscribe — acts on the selected domain *or* sender
+- `h`/`l` (or `←`/`→`) — collapse / expand the tree (domain → sender → message)
+- `Enter` — load the selected message's attachment list into Details
+- `a` — archive attachments of the selected domain / sender / message
+- `d` trash · `s` mark spam · `u` unsubscribe — acts on the selected node
 - `q` — quit
 
-The inbox syncs in the background: the Domains panel fills in as messages arrive,
-with a progress bar until the scan completes.
+The inbox syncs in the background: the domain → sender → message tree fills in as
+messages arrive, with a progress bar until the scan completes.
+
+### Attachment archives
+
+Pressing `a` downloads the attachments under the current selection and writes a
+zip to `~/.config/mailsweep/archives/<account>-<timestamp>.zip`, organized as
+`<domain>/<sender>/<message-id>__<filename>`, alongside a `manifest.json`
+describing every archived message and attachment.
 
 ## Performance
 

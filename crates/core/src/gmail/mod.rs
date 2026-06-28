@@ -1,3 +1,3 @@
 mod client;
 
-pub use client::{FetchProgress, FetchReport, GmailClient, Profile};
+pub use client::{AttachmentInfo, FetchProgress, FetchReport, GmailClient, Profile};

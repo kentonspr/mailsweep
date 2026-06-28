@@ -13,6 +13,11 @@ use rusqlite::{params, Connection};
 
 use crate::model::MessageMeta;
 
+/// Bump whenever the cached row shape changes. On mismatch the cache is reset
+/// (it is just a fetch cache, so discarding and refetching is always safe) —
+/// this avoids silently serving rows missing newly-added fields.
+const SCHEMA_VERSION: i64 = 1;
+
 #[derive(Clone)]
 pub struct Cache {
     conn: Arc<Mutex<Connection>>,
@@ -26,6 +31,15 @@ impl Cache {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(path).context("opening metadata cache")?;
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if version != SCHEMA_VERSION {
+            conn.execute_batch("DROP TABLE IF EXISTS messages;")
+                .context("resetting outdated cache")?;
+        }
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
                 id                    TEXT PRIMARY KEY,
@@ -33,11 +47,15 @@ impl Cache {
                 from_name             TEXT,
                 from_email            TEXT NOT NULL,
                 subject               TEXT NOT NULL,
+                size_estimate         INTEGER NOT NULL DEFAULT 0,
+                internal_date         INTEGER NOT NULL DEFAULT 0,
                 list_unsubscribe      TEXT,
                 list_unsubscribe_post TEXT
             );",
         )
         .context("initializing cache schema")?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION).ok();
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -51,6 +69,7 @@ impl Cache {
             let conn = conn.lock().expect("cache mutex poisoned");
             let mut stmt = conn.prepare(
                 "SELECT id, thread_id, from_name, from_email, subject,
+                        size_estimate, internal_date,
                         list_unsubscribe, list_unsubscribe_post
                  FROM messages WHERE id = ?1",
             )?;
@@ -63,8 +82,10 @@ impl Cache {
                         from_name: r.get(2)?,
                         from_email: r.get(3)?,
                         subject: r.get(4)?,
-                        list_unsubscribe: r.get(5)?,
-                        list_unsubscribe_post: r.get(6)?,
+                        size_estimate: r.get(5)?,
+                        internal_date: r.get(6)?,
+                        list_unsubscribe: r.get(7)?,
+                        list_unsubscribe_post: r.get(8)?,
                     })
                 });
                 match row {
@@ -91,8 +112,9 @@ impl Cache {
                 let mut stmt = tx.prepare(
                     "INSERT OR REPLACE INTO messages
                         (id, thread_id, from_name, from_email, subject,
+                         size_estimate, internal_date,
                          list_unsubscribe, list_unsubscribe_post)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 )?;
                 for m in &metas {
                     stmt.execute(params![
@@ -101,6 +123,8 @@ impl Cache {
                         m.from_name,
                         m.from_email,
                         m.subject,
+                        m.size_estimate,
+                        m.internal_date,
                         m.list_unsubscribe,
                         m.list_unsubscribe_post,
                     ])?;

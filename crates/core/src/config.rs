@@ -37,3 +37,8 @@ pub fn token_cache_path() -> PathBuf {
 pub fn cache_path() -> PathBuf {
     config_dir().join("metadata.sqlite3")
 }
+
+/// Directory where attachment archives are written.
+pub fn archive_dir() -> PathBuf {
+    config_dir().join("archives")
+}

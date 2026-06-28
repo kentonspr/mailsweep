@@ -12,6 +12,10 @@ pub struct MessageMeta {
     pub from_name: Option<String>,
     pub from_email: String,
     pub subject: String,
+    /// Gmail's rough size estimate in bytes.
+    pub size_estimate: u64,
+    /// Internal received timestamp in epoch milliseconds (0 if unknown).
+    pub internal_date: i64,
     pub list_unsubscribe: Option<String>,
     pub list_unsubscribe_post: Option<String>,
 }
@@ -43,19 +47,22 @@ impl SenderGroup {
     }
 }
 
-/// One sender (email address) within a domain.
+/// One sender (email address) within a domain, holding its messages.
 #[derive(Debug, Clone)]
 pub struct SenderEntry {
     pub email: String,
     pub name: Option<String>,
-    pub message_ids: Vec<String>,
-    pub sample_subjects: Vec<String>,
+    pub messages: Vec<MessageMeta>,
     pub unsubscribe: Option<UnsubscribeInfo>,
 }
 
 impl SenderEntry {
     pub fn count(&self) -> usize {
-        self.message_ids.len()
+        self.messages.len()
+    }
+
+    pub fn message_ids(&self) -> Vec<String> {
+        self.messages.iter().map(|m| m.id.clone()).collect()
     }
 }
 
@@ -63,20 +70,28 @@ impl SenderEntry {
 #[derive(Debug, Clone)]
 pub struct DomainGroup {
     pub domain: String,
-    pub message_ids: Vec<String>,
     pub senders: Vec<SenderEntry>,
     pub unsubscribe: Option<UnsubscribeInfo>,
 }
 
 impl DomainGroup {
     pub fn count(&self) -> usize {
-        self.message_ids.len()
+        self.senders.iter().map(SenderEntry::count).sum()
+    }
+
+    pub fn sender_count(&self) -> usize {
+        self.senders.len()
+    }
+
+    pub fn message_ids(&self) -> Vec<String> {
+        self.senders.iter().flat_map(SenderEntry::message_ids).collect()
     }
 }
 
 /// Group messages by domain, then by sender within each domain. Domains and
-/// senders are both sorted by message count descending. This is the tree the
-/// TUI renders (domain rows that expand to sender rows).
+/// senders are sorted by message count descending; a sender's messages are
+/// sorted newest-first. This is the tree the TUI renders (domain → sender →
+/// message).
 pub fn group_messages(messages: &[MessageMeta]) -> Vec<DomainGroup> {
     let mut domains: HashMap<String, HashMap<String, SenderEntry>> = HashMap::new();
 
@@ -87,14 +102,10 @@ pub fn group_messages(messages: &[MessageMeta]) -> Vec<DomainGroup> {
             .or_insert_with(|| SenderEntry {
                 email: m.from_email.clone(),
                 name: m.from_name.clone(),
-                message_ids: Vec::new(),
-                sample_subjects: Vec::new(),
+                messages: Vec::new(),
                 unsubscribe: None,
             });
-        entry.message_ids.push(m.id.clone());
-        if entry.sample_subjects.len() < 5 {
-            entry.sample_subjects.push(m.subject.clone());
-        }
+        entry.messages.push(m.clone());
         if entry.unsubscribe.is_none() {
             entry.unsubscribe = unsubscribe::parse(
                 m.list_unsubscribe.as_deref(),
@@ -107,12 +118,13 @@ pub fn group_messages(messages: &[MessageMeta]) -> Vec<DomainGroup> {
         .into_iter()
         .map(|(domain, senders_map)| {
             let mut senders: Vec<SenderEntry> = senders_map.into_values().collect();
+            for s in &mut senders {
+                s.messages.sort_by(|a, b| b.internal_date.cmp(&a.internal_date));
+            }
             senders.sort_by(|a, b| b.count().cmp(&a.count()));
-            let message_ids = senders.iter().flat_map(|s| s.message_ids.clone()).collect();
             let unsubscribe = senders.iter().find_map(|s| s.unsubscribe.clone());
             DomainGroup {
                 domain,
-                message_ids,
                 senders,
                 unsubscribe,
             }

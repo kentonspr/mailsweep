@@ -8,8 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+use base64::Engine;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde::Deserialize;
@@ -314,6 +316,81 @@ impl GmailClient {
             threads_total: resp.threads_total,
         })
     }
+
+    /// List a message's attachments (filename, type, size, download handle).
+    pub async fn message_attachments(&self, message_id: &str) -> Result<Vec<AttachmentInfo>> {
+        let bearer = self.bearer().await?;
+        let resp: FullMessageResp = self
+            .http
+            .get(format!("{BASE}/messages/{message_id}"))
+            .header("Authorization", &bearer)
+            .query(&[("format", "full")])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let mut out = Vec::new();
+        collect_attachments(&resp.payload, &mut out);
+        Ok(out)
+    }
+
+    /// Download one attachment's raw bytes.
+    pub async fn download_attachment(
+        &self,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<Vec<u8>> {
+        let bearer = self.bearer().await?;
+        let resp: AttachmentResp = self
+            .http
+            .get(format!(
+                "{BASE}/messages/{message_id}/attachments/{attachment_id}"
+            ))
+            .header("Authorization", &bearer)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        base64_url()
+            .decode(resp.data.as_bytes())
+            .map_err(|e| anyhow!("decoding attachment data: {e}"))
+    }
+}
+
+/// Information about a single attachment part.
+#[derive(Debug, Clone)]
+pub struct AttachmentInfo {
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub attachment_id: String,
+}
+
+/// Gmail attachment data is base64url, sometimes unpadded — accept either.
+fn base64_url() -> GeneralPurpose {
+    GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    )
+}
+
+/// Walk a MIME part tree, collecting parts that are downloadable attachments.
+fn collect_attachments(part: &FullPart, out: &mut Vec<AttachmentInfo>) {
+    if !part.filename.is_empty() {
+        if let Some(id) = &part.body.attachment_id {
+            out.push(AttachmentInfo {
+                filename: part.filename.clone(),
+                mime_type: part.mime_type.clone(),
+                size: part.body.size,
+                attachment_id: id.clone(),
+            });
+        }
+    }
+    for child in &part.parts {
+        collect_attachments(child, out);
+    }
 }
 
 #[async_trait]
@@ -428,6 +505,8 @@ fn meta_from_resp(resp: MessageResp) -> MessageMeta {
         subject: header(headers, "Subject")
             .unwrap_or("(no subject)")
             .to_string(),
+        size_estimate: resp.size_estimate,
+        internal_date: resp.internal_date.parse().unwrap_or(0),
         list_unsubscribe: header(headers, "List-Unsubscribe").map(str::to_string),
         list_unsubscribe_post: header(headers, "List-Unsubscribe-Post").map(str::to_string),
     }
@@ -473,6 +552,10 @@ struct MessageResp {
     id: String,
     thread_id: String,
     #[serde(default)]
+    size_estimate: u64,
+    #[serde(default)]
+    internal_date: String,
+    #[serde(default)]
     payload: Payload,
 }
 
@@ -496,6 +579,40 @@ struct ProfileResp {
     messages_total: u64,
     #[serde(default)]
     threads_total: u64,
+}
+
+#[derive(Deserialize)]
+struct FullMessageResp {
+    #[serde(default)]
+    payload: FullPart,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct FullPart {
+    #[serde(default)]
+    filename: String,
+    #[serde(default)]
+    mime_type: String,
+    #[serde(default)]
+    body: PartBody,
+    #[serde(default)]
+    parts: Vec<FullPart>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PartBody {
+    #[serde(default)]
+    attachment_id: Option<String>,
+    #[serde(default)]
+    size: u64,
+}
+
+#[derive(Deserialize)]
+struct AttachmentResp {
+    #[serde(default)]
+    data: String,
 }
 
 #[cfg(test)]

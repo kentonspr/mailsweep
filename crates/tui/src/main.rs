@@ -1,18 +1,17 @@
 //! Ratatui frontend for Mailsweep.
 //!
-//! Opens immediately and streams the inbox sync into the UI, populating a
-//! domain → sender tree as messages arrive. Three numbered panels (Accounts,
-//! Domains, Details); the Domains panel has tabbed views (All / Subscriptions /
-//! Attachments).
+//! Streams the inbox sync into a domain → sender → message tree. Three numbered
+//! panels (Accounts, Domains, Details); the Domains panel has tabbed views
+//! (All / Subscriptions / Attachments).
 //!
-//! Keys: `1`/`2`/`3` focus a panel · `Tab`/`Shift-Tab` switch view · `j`/`k`
-//! move · `h`/`l` collapse/expand · `d` trash · `s` spam · `u` unsubscribe ·
-//! `q` quit.
+//! Keys: `1`/`2`/`3` focus · `Tab`/`Shift-Tab` switch view · `j`/`k` move ·
+//! `h`/`l` collapse/expand · `Enter` load attachments · `a` archive
+//! attachments · `d` trash · `s` spam · `u` unsubscribe · `q` quit.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -24,20 +23,21 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use mailsweep_core::{
-    config, group_messages, Cache, DomainGroup, FetchProgress, GmailAuth, GmailClient,
-    MailProvider, MessageMeta, Profile, SenderEntry, UnsubscribeInfo,
+    archive_attachments, config, group_messages, ArchiveItem, AttachmentInfo, Cache, DomainGroup,
+    FetchProgress, GmailAuth, GmailClient, MailProvider, MessageMeta, Profile, SenderEntry,
+    UnsubscribeInfo,
 };
 
 const SCAN_LIMIT: usize = 1000;
 const HELP: &str = "1/2/3 focus · Tab view · j/k move · h/l collapse/expand · \
-    d trash · s spam · u unsubscribe · q quit";
+    Enter attachments · a archive · d trash · s spam · u unsub · q quit";
 
-/// Messages streamed from the background scan task into the UI.
+/// Messages streamed from the background scan / archive tasks into the UI.
 enum ScanEvent {
     Account(Profile),
     Status(String),
@@ -50,6 +50,7 @@ enum ScanEvent {
     },
     Done(String),
     Failed(String),
+    Notice(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -70,11 +71,7 @@ impl View {
     const ALL: [View; 3] = [View::All, View::Subscriptions, View::Attachments];
 
     fn index(self) -> usize {
-        match self {
-            View::All => 0,
-            View::Subscriptions => 1,
-            View::Attachments => 2,
-        }
+        View::ALL.iter().position(|v| *v == self).unwrap_or(0)
     }
 
     fn title(self) -> &'static str {
@@ -94,13 +91,21 @@ impl View {
     }
 }
 
-/// A flattened tree row: either a domain or one of its senders (when expanded).
+/// A flattened tree row at one of three depths.
 enum Row<'a> {
     Domain(&'a DomainGroup),
     Sender(&'a DomainGroup, &'a SenderEntry),
+    Message(&'a DomainGroup, &'a SenderEntry, &'a MessageMeta),
 }
 
-/// The thing the current selection acts on (a whole domain or a single sender).
+/// Owned identifier for the selected node (avoids borrow conflicts on mutation).
+enum Node {
+    Domain(String),
+    Sender(String),
+    Message,
+}
+
+/// What an action (trash/spam/unsubscribe) operates on.
 struct Target {
     ids: Vec<String>,
     label: String,
@@ -119,9 +124,11 @@ struct App {
     account: Option<Profile>,
     metas: Vec<MessageMeta>,
     attachment_ids: HashSet<String>,
+    attachments: HashMap<String, Vec<AttachmentInfo>>,
     view: View,
     groups: Vec<DomainGroup>,
-    expanded: HashSet<String>,
+    expanded_domains: HashSet<String>,
+    expanded_senders: HashSet<String>,
     selected: usize,
     detail_scroll: u16,
     focus: Panel,
@@ -135,9 +142,11 @@ impl App {
             account: None,
             metas: Vec::new(),
             attachment_ids: HashSet::new(),
+            attachments: HashMap::new(),
             view: View::All,
             groups: Vec::new(),
-            expanded: HashSet::new(),
+            expanded_domains: HashSet::new(),
+            expanded_senders: HashSet::new(),
             selected: 0,
             detail_scroll: 0,
             focus: Panel::Domains,
@@ -155,6 +164,7 @@ impl App {
         match event {
             ScanEvent::Account(p) => self.account = Some(p),
             ScanEvent::Status(s) => self.sync.message = s,
+            ScanEvent::Notice(s) => self.status = s,
             ScanEvent::Listed(n) => {
                 self.sync.total = n;
                 self.sync.message = format!("Listed {n} messages");
@@ -223,24 +233,22 @@ impl App {
         let mut rows = Vec::new();
         for g in &self.groups {
             rows.push(Row::Domain(g));
-            if self.expanded.contains(&g.domain) {
+            if self.expanded_domains.contains(&g.domain) {
                 for s in &g.senders {
                     rows.push(Row::Sender(g, s));
+                    if self.expanded_senders.contains(&s.email) {
+                        for m in &s.messages {
+                            rows.push(Row::Message(g, s, m));
+                        }
+                    }
                 }
             }
         }
         rows
     }
 
-    fn row_count(&self) -> usize {
-        self.groups
-            .iter()
-            .map(|g| 1 + if self.expanded.contains(&g.domain) { g.senders.len() } else { 0 })
-            .sum()
-    }
-
     fn clamp_selection(&mut self) {
-        let n = self.row_count();
+        let n = self.rows().len();
         self.selected = if n == 0 { 0 } else { self.selected.min(n - 1) };
     }
 
@@ -251,7 +259,7 @@ impl App {
             self.detail_scroll = self.detail_scroll.saturating_add(1);
             return;
         }
-        let n = self.row_count();
+        let n = self.rows().len();
         if n > 0 {
             self.selected = (self.selected + 1).min(n - 1);
             self.detail_scroll = 0;
@@ -267,65 +275,150 @@ impl App {
         self.detail_scroll = 0;
     }
 
+    fn node(&self) -> Option<Node> {
+        match self.rows().get(self.selected)? {
+            Row::Domain(g) => Some(Node::Domain(g.domain.clone())),
+            Row::Sender(_, s) => Some(Node::Sender(s.email.clone())),
+            Row::Message(..) => Some(Node::Message),
+        }
+    }
+
+    fn current_domain(&self) -> Option<String> {
+        match self.rows().get(self.selected)? {
+            Row::Domain(g) | Row::Sender(g, _) | Row::Message(g, _, _) => Some(g.domain.clone()),
+        }
+    }
+
+    fn current_sender(&self) -> Option<String> {
+        match self.rows().get(self.selected)? {
+            Row::Sender(_, s) | Row::Message(_, s, _) => Some(s.email.clone()),
+            Row::Domain(_) => None,
+        }
+    }
+
     fn expand(&mut self) {
-        if let Some(Target { label, .. }) = self.target() {
-            if self.is_domain_row() {
-                self.expanded.insert(label);
+        match self.node() {
+            Some(Node::Domain(d)) => {
+                self.expanded_domains.insert(d);
             }
+            Some(Node::Sender(e)) => {
+                self.expanded_senders.insert(e);
+            }
+            _ => {}
         }
     }
 
     fn collapse(&mut self) {
-        let domain = match self.selection() {
-            Some((domain, is_domain)) => {
-                if !is_domain {
-                    // On a sender row: collapse the parent and reselect it.
-                    let pos = self
-                        .rows()
-                        .iter()
-                        .position(|r| matches!(r, Row::Domain(g) if g.domain == domain));
-                    if let Some(p) = pos {
-                        self.selected = p;
-                    }
-                }
-                domain
+        match self.node() {
+            Some(Node::Domain(d)) => {
+                self.expanded_domains.remove(&d);
             }
-            None => return,
-        };
-        self.expanded.remove(&domain);
-    }
-
-    /// (domain name, is this row a domain row?)
-    fn selection(&self) -> Option<(String, bool)> {
-        match self.rows().get(self.selected)? {
-            Row::Domain(g) => Some((g.domain.clone(), true)),
-            Row::Sender(g, _) => Some((g.domain.clone(), false)),
+            Some(Node::Sender(e)) => {
+                if self.expanded_senders.remove(&e) {
+                    // collapsed the sender in place
+                } else if let Some(domain) = self.current_domain() {
+                    self.expanded_domains.remove(&domain);
+                    self.select_domain(&domain);
+                }
+            }
+            Some(Node::Message) => {
+                if let Some(email) = self.current_sender() {
+                    self.expanded_senders.remove(&email);
+                    self.select_sender(&email);
+                }
+            }
+            None => {}
         }
     }
 
-    fn is_domain_row(&self) -> bool {
-        matches!(self.rows().get(self.selected), Some(Row::Domain(_)))
+    fn select_domain(&mut self, domain: &str) {
+        let pos = self
+            .rows()
+            .iter()
+            .position(|r| matches!(r, Row::Domain(g) if g.domain == domain));
+        if let Some(p) = pos {
+            self.selected = p;
+        }
+    }
+
+    fn select_sender(&mut self, email: &str) {
+        let pos = self
+            .rows()
+            .iter()
+            .position(|r| matches!(r, Row::Sender(_, s) if s.email == email));
+        if let Some(p) = pos {
+            self.selected = p;
+        }
+    }
+
+    fn selected_message_id(&self) -> Option<String> {
+        match self.rows().get(self.selected)? {
+            Row::Message(_, _, m) => Some(m.id.clone()),
+            _ => None,
+        }
     }
 
     fn target(&self) -> Option<Target> {
         match self.rows().get(self.selected)? {
             Row::Domain(g) => Some(Target {
-                ids: g.message_ids.clone(),
+                ids: g.message_ids(),
                 label: g.domain.clone(),
                 unsubscribe: g.unsubscribe.clone(),
             }),
             Row::Sender(_, s) => Some(Target {
-                ids: s.message_ids.clone(),
+                ids: s.message_ids(),
                 label: s.email.clone(),
+                unsubscribe: s.unsubscribe.clone(),
+            }),
+            Row::Message(_, s, m) => Some(Target {
+                ids: vec![m.id.clone()],
+                label: m.subject.clone(),
+                // A single message inherits its sender's unsubscribe handle.
                 unsubscribe: s.unsubscribe.clone(),
             }),
         }
     }
 
-    /// Drop the given messages from the model (after trash/spam) and regroup.
+    /// Collect archivable messages (those with attachments) under the selection.
+    fn archive_items(&self) -> Vec<ArchiveItem> {
+        let has_attachment = |m: &MessageMeta| self.attachment_ids.contains(&m.id);
+        let item = |g: &DomainGroup, s: &SenderEntry, m: &MessageMeta| ArchiveItem {
+            message_id: m.id.clone(),
+            domain: g.domain.clone(),
+            sender: s.email.clone(),
+            subject: m.subject.clone(),
+            date_ms: m.internal_date,
+        };
+        match self.rows().get(self.selected) {
+            Some(Row::Domain(g)) => g
+                .senders
+                .iter()
+                .flat_map(|s| {
+                    s.messages
+                        .iter()
+                        .filter(|m| has_attachment(m))
+                        .map(move |m| item(g, s, m))
+                })
+                .collect(),
+            Some(Row::Sender(g, s)) => s
+                .messages
+                .iter()
+                .filter(|m| has_attachment(m))
+                .map(|m| item(g, s, m))
+                .collect(),
+            Some(Row::Message(g, s, m)) if has_attachment(m) => vec![item(g, s, m)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Drop messages from the model (after trash/spam) and regroup.
     fn remove_messages(&mut self, ids: &[String]) {
         let set: HashSet<&str> = ids.iter().map(String::as_str).collect();
         self.metas.retain(|m| !set.contains(m.id.as_str()));
+        for id in ids {
+            self.attachment_ids.remove(id);
+            self.attachments.remove(id);
+        }
         self.rebuild_groups();
     }
 }
@@ -335,8 +428,9 @@ async fn main() -> Result<()> {
     let client = setup()?;
     let (tx, rx) = mpsc::unbounded_channel();
     let scan_client = client.clone();
-    tokio::spawn(async move { run_scan(scan_client, tx).await });
-    run(client, rx).await
+    let scan_tx = tx.clone();
+    tokio::spawn(async move { run_scan(scan_client, scan_tx).await });
+    run(client, rx, tx).await
 }
 
 fn setup() -> Result<GmailClient> {
@@ -367,7 +461,6 @@ async fn run_scan(client: GmailClient, tx: UnboundedSender<ScanEvent>) {
     };
     let _ = tx.send(ScanEvent::Listed(ids.len()));
 
-    // Cheap secondary query to power the Attachments view.
     if let Ok(att) = client
         .list_message_ids(Some("in:inbox has:attachment"), SCAN_LIMIT)
         .await
@@ -401,14 +494,18 @@ async fn run_scan(client: GmailClient, tx: UnboundedSender<ScanEvent>) {
     let _ = tx.send(ScanEvent::Done(summary));
 }
 
-async fn run(client: GmailClient, mut rx: UnboundedReceiver<ScanEvent>) -> Result<()> {
+async fn run(
+    client: GmailClient,
+    mut rx: UnboundedReceiver<ScanEvent>,
+    tx: UnboundedSender<ScanEvent>,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let mut app = App::new();
 
-    let result = event_loop(&mut terminal, &client, &mut app, &mut rx).await;
+    let result = event_loop(&mut terminal, &client, &tx, &mut app, &mut rx).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -419,6 +516,7 @@ async fn run(client: GmailClient, mut rx: UnboundedReceiver<ScanEvent>) -> Resul
 async fn event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     client: &GmailClient,
+    tx: &UnboundedSender<ScanEvent>,
     app: &mut App,
     rx: &mut UnboundedReceiver<ScanEvent>,
 ) -> Result<()> {
@@ -430,7 +528,7 @@ async fn event_loop<B: Backend>(
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && handle_key(app, client, key.code).await? {
+                if key.kind == KeyEventKind::Press && handle_key(app, client, tx, key.code).await? {
                     break;
                 }
             }
@@ -440,7 +538,12 @@ async fn event_loop<B: Backend>(
 }
 
 /// Returns `Ok(true)` when the user asked to quit.
-async fn handle_key(app: &mut App, client: &GmailClient, code: KeyCode) -> Result<bool> {
+async fn handle_key(
+    app: &mut App,
+    client: &GmailClient,
+    tx: &UnboundedSender<ScanEvent>,
+    code: KeyCode,
+) -> Result<bool> {
     match code {
         KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
         KeyCode::Char('1') => app.focus = Panel::Accounts,
@@ -452,12 +555,64 @@ async fn handle_key(app: &mut App, client: &GmailClient, code: KeyCode) -> Resul
         KeyCode::Char('h') | KeyCode::Left => app.collapse(),
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::Enter => load_attachments(app, client).await,
+        KeyCode::Char('a') => archive(app, client, tx),
         KeyCode::Char('d') => act(app, client, Action::Trash).await,
         KeyCode::Char('s') => act(app, client, Action::Spam).await,
         KeyCode::Char('u') => app.status = unsubscribe(app, client).await,
         _ => {}
     }
     Ok(false)
+}
+
+async fn load_attachments(app: &mut App, client: &GmailClient) {
+    let Some(id) = app.selected_message_id() else { return };
+    if app.attachments.contains_key(&id) {
+        return;
+    }
+    app.status = "Loading attachments…".to_string();
+    match client.message_attachments(&id).await {
+        Ok(list) => {
+            app.attachments.insert(id, list);
+            app.status = HELP.to_string();
+        }
+        Err(e) => app.status = format!("Attachment load failed: {e}"),
+    }
+}
+
+fn archive(app: &mut App, client: &GmailClient, tx: &UnboundedSender<ScanEvent>) {
+    let items = app.archive_items();
+    if items.is_empty() {
+        app.status = "No attachments to archive in selection".to_string();
+        return;
+    }
+    let account = app
+        .account
+        .as_ref()
+        .map(|p| p.email.replace('/', "_"))
+        .unwrap_or_else(|| "mailbox".to_string());
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = config::archive_dir().join(format!("{account}-{ts}.zip"));
+
+    app.status = format!("Archiving attachments from {} message(s)…", items.len());
+    let client = client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let msg = match archive_attachments(&client, &items, &path).await {
+            Ok(s) => format!(
+                "Archived {} file(s) ({}) from {} message(s) → {}",
+                s.files,
+                human_bytes(s.bytes),
+                s.messages,
+                s.path.display()
+            ),
+            Err(e) => format!("Archive failed: {e}"),
+        };
+        let _ = tx.send(ScanEvent::Notice(msg));
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -482,7 +637,7 @@ async fn act(app: &mut App, client: &GmailClient, action: Action) {
     app.status = match result {
         Ok(()) => {
             app.remove_messages(&target.ids);
-            format!("{verb} {n} messages from {}", target.label)
+            format!("{verb} {n} message(s) from {}", target.label)
         }
         Err(e) => format!("Action failed: {e}"),
     };
@@ -573,30 +728,45 @@ fn render_accounts(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn tabs_line(active: View) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (i, v) in View::ALL.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let style = if *v == active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(format!("[{}]", v.title()), style));
+    }
+    Line::from(spans)
+}
+
 fn render_domains(f: &mut Frame, app: &App, area: Rect) {
     let block = panel_block(app, Panel::Domains, format!("2 Domains ({})", app.groups.len()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // [tabs][optional progress gauge][list]
-    let mut constraints = vec![Constraint::Length(1)];
+    // [tabs][column header][optional gauge][list]
     let syncing = !app.sync.done;
+    let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
     if syncing {
         constraints.push(Constraint::Length(1));
     }
     constraints.push(Constraint::Min(1));
     let chunks = Layout::vertical(constraints).split(inner);
 
-    let titles: Vec<Line> = View::ALL.iter().map(|v| Line::from(v.title())).collect();
-    let tabs = Tabs::new(titles)
-        .select(app.view.index())
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .divider(" ");
-    f.render_widget(tabs, chunks[0]);
+    f.render_widget(Paragraph::new(tabs_line(app.view)), chunks[0]);
+
+    let header = Line::from(Span::styled(
+        format!("{:3}{:>7} {:>8}  {}", "", "Senders", "Messages", "Name"),
+        Style::default().add_modifier(Modifier::UNDERLINED),
+    ));
+    f.render_widget(Paragraph::new(header), chunks[1]);
 
     if syncing {
         let ratio = if app.sync.total > 0 {
@@ -608,46 +778,11 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
             .gauge_style(Style::default().fg(Color::Cyan))
             .ratio(ratio.clamp(0.0, 1.0))
             .label(format!("{}/{}", app.sync.resolved, app.sync.total));
-        f.render_widget(gauge, chunks[1]);
+        f.render_widget(gauge, chunks[2]);
     }
 
     let list_area = *chunks.last().expect("list chunk present");
-    let items: Vec<ListItem> = app
-        .rows()
-        .iter()
-        .map(|row| match row {
-            Row::Domain(g) => {
-                let marker = if app.expanded.contains(&g.domain) {
-                    "▾"
-                } else {
-                    "▸"
-                };
-                let unsub = if g.unsubscribe.is_some() { " ✉" } else { "" };
-                ListItem::new(Line::from(vec![
-                    Span::raw(format!("{marker} ")),
-                    Span::styled(
-                        format!("{:>5}  ", g.count()),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(g.domain.clone()),
-                    Span::raw(unsub),
-                ]))
-            }
-            Row::Sender(_, s) => {
-                let unsub = if s.unsubscribe.is_some() { " ✉" } else { "" };
-                let who = s.name.clone().unwrap_or_else(|| s.email.clone());
-                ListItem::new(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(
-                        format!("{:>5}  ", s.count()),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::raw(format!("{who} <{}>", s.email)),
-                    Span::raw(unsub),
-                ]))
-            }
-        })
-        .collect();
+    let items: Vec<ListItem> = app.rows().iter().map(|r| ListItem::new(row_line(app, r))).collect();
 
     let mut state = ListState::default();
     if !items.is_empty() {
@@ -657,6 +792,48 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("");
     f.render_stateful_widget(list, list_area, &mut state);
+}
+
+fn row_line(app: &App, row: &Row) -> Line<'static> {
+    match row {
+        Row::Domain(g) => {
+            let marker = if app.expanded_domains.contains(&g.domain) {
+                '▾'
+            } else {
+                '▸'
+            };
+            let unsub = if g.unsubscribe.is_some() { " ✉" } else { "" };
+            Line::from(format!(
+                "{marker}  {:>7} {:>8}  {}{unsub}",
+                g.sender_count(),
+                g.count(),
+                g.domain
+            ))
+        }
+        Row::Sender(_, s) => {
+            let marker = if app.expanded_senders.contains(&s.email) {
+                '▾'
+            } else {
+                '▸'
+            };
+            let unsub = if s.unsubscribe.is_some() { " ✉" } else { "" };
+            let who = s.name.clone().unwrap_or_else(|| s.email.clone());
+            Line::from(format!(
+                " {marker} {:>7} {:>8}    {who} <{}>{unsub}",
+                "",
+                s.count(),
+                s.email
+            ))
+        }
+        Row::Message(_, _, m) => Line::from(format!(
+            "   {:>7} {:>8}      {}  {:>8}  {}",
+            "",
+            "",
+            fmt_date_short(m.internal_date),
+            human_bytes(m.size_estimate),
+            m.subject
+        )),
+    }
 }
 
 fn render_details(f: &mut Frame, app: &App, area: Rect) {
@@ -684,7 +861,8 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
         return vec![Line::from("No selection.")];
     };
 
-    let bold = |s: String| Line::from(Span::styled(s, Style::default().add_modifier(Modifier::BOLD)));
+    let bold =
+        |s: String| Line::from(Span::styled(s, Style::default().add_modifier(Modifier::BOLD)));
     let underline = |s: &str| {
         Line::from(Span::styled(
             s.to_string(),
@@ -696,15 +874,19 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
         Row::Domain(g) => {
             let mut lines = vec![
                 bold(g.domain.clone()),
-                Line::from(format!("{} messages · {} senders", g.count(), g.senders.len())),
+                Line::from(format!(
+                    "{} messages · {} senders",
+                    g.count(),
+                    g.sender_count()
+                )),
                 Line::from(""),
             ];
             if let Some(u) = &g.unsubscribe {
                 lines.push(unsub_line(u));
                 lines.push(Line::from(""));
             }
-            lines.push(underline("Top senders (press l to expand):"));
-            for s in g.senders.iter().take(10) {
+            lines.push(underline("Top senders (press l to expand the tree):"));
+            for s in g.senders.iter().take(12) {
                 lines.push(Line::from(format!("· {:>4}  {}", s.count(), s.email)));
             }
             lines
@@ -720,11 +902,75 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                 lines.push(unsub_line(u));
                 lines.push(Line::from(""));
             }
-            lines.push(underline("Recent subjects:"));
-            for subj in &s.sample_subjects {
-                lines.push(Line::from(format!("· {subj}")));
+            lines.push(underline("Recent messages (press l to expand the tree):"));
+            for m in s.messages.iter().take(12) {
+                lines.push(Line::from(format!(
+                    "· {}  {}",
+                    fmt_date_short(m.internal_date),
+                    m.subject
+                )));
+            }
+            lines
+        }
+        Row::Message(_, s, m) => {
+            let mut lines = vec![
+                bold(m.subject.clone()),
+                Line::from(format!("From: {}", s.email)),
+                Line::from(format!("Date: {}", fmt_date(m.internal_date))),
+                Line::from(format!("Size: {}", human_bytes(m.size_estimate))),
+                Line::from(""),
+            ];
+            match app.attachments.get(&m.id) {
+                Some(atts) if !atts.is_empty() => {
+                    lines.push(underline("Attachments (press a to archive):"));
+                    for a in atts {
+                        lines.push(Line::from(format!(
+                            "· {} ({}, {})",
+                            a.filename,
+                            a.mime_type,
+                            human_bytes(a.size)
+                        )));
+                    }
+                }
+                Some(_) => lines.push(Line::from("No attachments on this message.")),
+                None if app.attachment_ids.contains(&m.id) => {
+                    lines.push(Line::from("Has attachments — press Enter to load details."))
+                }
+                None => {}
             }
             lines
         }
     }
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+fn fmt_date(ms: i64) -> String {
+    if ms <= 0 {
+        return "—".to_string();
+    }
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn fmt_date_short(ms: i64) -> String {
+    if ms <= 0 {
+        return "     ".to_string();
+    }
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.format("%m-%d").to_string())
+        .unwrap_or_else(|| "     ".to_string())
 }
