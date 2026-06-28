@@ -34,7 +34,6 @@ use mailsweep_core::{
     UnsubscribeInfo,
 };
 
-const SCAN_LIMIT: usize = 1000;
 const HELP: &str = "Tab view · o sort · j/k move · h/l fold · Space mark · c clear · \
     Enter attach · a archive · A archive+del · d trash · s spam · u unsub · q quit";
 
@@ -621,8 +620,9 @@ async fn run_scan(client: GmailClient, tx: UnboundedSender<ScanEvent>) {
         }
     }
 
+    let limit = config::scan_limit();
     let _ = tx.send(ScanEvent::Status("Listing inbox…".to_string()));
-    let ids = match client.list_message_ids(Some("in:inbox"), SCAN_LIMIT).await {
+    let ids = match client.list_message_ids(Some("in:inbox"), limit).await {
         Ok(v) => v,
         Err(e) => {
             let _ = tx.send(ScanEvent::Failed(e.to_string()));
@@ -632,7 +632,7 @@ async fn run_scan(client: GmailClient, tx: UnboundedSender<ScanEvent>) {
     let _ = tx.send(ScanEvent::Listed(ids.len()));
 
     let attachment_ids = client
-        .list_message_ids(Some("in:inbox has:attachment"), SCAN_LIMIT)
+        .list_message_ids(Some("in:inbox has:attachment"), limit)
         .await
         .unwrap_or_default();
     let _ = tx.send(ScanEvent::AttachmentIds(
@@ -945,7 +945,7 @@ fn render_accounts(f: &mut Frame, app: &App, area: Rect) {
     )));
 
     f.render_widget(
-        Paragraph::new(lines).block(panel_block(app, Panel::Accounts, "1 Accounts")),
+        Paragraph::new(lines).block(panel_block(app, Panel::Accounts, "[1] Accounts")),
         area,
     );
 }
@@ -975,7 +975,7 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
         format!(" · {} marked", app.marked.len())
     };
     let title = format!(
-        "2 Domains ({}{}) · sort {}",
+        "[2] Domains ({}{}) · sort {}",
         app.groups.len(),
         marked,
         app.sort.label()
@@ -1087,7 +1087,7 @@ fn row_line(app: &App, row: &Row) -> Line<'static> {
 
 fn render_details(f: &mut Frame, app: &App, area: Rect) {
     let widget = Paragraph::new(detail_lines(app))
-        .block(panel_block(app, Panel::Details, "3 Details"))
+        .block(panel_block(app, Panel::Details, "[3] Details"))
         .wrap(Wrap { trim: true })
         .scroll((app.detail_scroll, 0));
     f.render_widget(widget, area);
