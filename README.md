@@ -50,19 +50,26 @@ First launch opens a browser for consent; the token is cached to
 ### Keys (TUI)
 
 - `1`/`2`/`3` — focus the Accounts / Domains / Details panel
-- `Tab` / `Shift-Tab` — switch domain view (All / Subscriptions / Attachments / Large)
+- `Tab` / `Shift-Tab` — switch domain view (All / Subscriptions / Attachments)
+- `o` — cycle sort (Messages / Size / Recent), applied to the current view
 - `j`/`k` (or `↑`/`↓`) — move within the focused panel (or scroll Details)
 - `h`/`l` (or `←`/`→`) — collapse / expand the tree (domain → sender → message)
 - `Space` — mark/unmark the selected node; `c` — clear all marks
 - `Enter` — load the selected message's attachment list into Details
 - `a` — archive attachments of the marked set (or the selected node)
+- `A` — archive **and** trash those messages
 - `d` trash · `s` mark spam · `u` unsubscribe — acts on the marked set, or the selected node
 - `q` — quit
 
 Views: **All** (everything), **Subscriptions** (senders with an unsubscribe
-header), **Attachments** (`has:attachment`), **Large** (sorted by total size,
-with aggregate sizes shown per domain/sender). Marks (`●` full, `◐` partial)
-let you batch a trash/spam/archive across many domains/senders/messages at once.
+header), **Attachments** (`has:attachment`). Sort each by message count, total
+size, or recency with `o`; under Size sort, aggregate sizes show per
+domain/sender. Marks (`●` full, `◐` partial) let you batch a trash/spam/archive
+across many domains/senders/messages at once.
+
+In the Attachments view, the app fetches each message's **actual** attachment
+sizes/filenames in the background after the sync, so sizes fill in (and `Enter`
+becomes instant) without per-message requests.
 
 The inbox syncs in the background: the domain → sender → message tree fills in as
 messages arrive, with a progress bar until the scan completes.

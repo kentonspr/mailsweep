@@ -26,6 +26,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::time::sleep;
 
 use mailsweep_core::{
     archive_attachments, config, group_messages, ArchiveItem, AttachmentInfo, Cache, DomainGroup,
@@ -34,7 +35,7 @@ use mailsweep_core::{
 };
 
 const SCAN_LIMIT: usize = 1000;
-const HELP: &str = "Tab view · j/k move · h/l fold · Space mark · c clear · \
+const HELP: &str = "Tab view · o sort · j/k move · h/l fold · Space mark · c clear · \
     Enter attach · a archive · A archive+del · d trash · s spam · u unsub · q quit";
 
 /// Messages streamed from the background scan / archive tasks into the UI.
@@ -53,6 +54,8 @@ enum ScanEvent {
     Notice(String),
     /// Messages removed by a background task (e.g. archive-and-delete).
     Removed(Vec<String>),
+    /// Actual attachment details for one message (background size fetch).
+    AttachmentDetails(String, Vec<AttachmentInfo>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,16 +70,10 @@ enum View {
     All,
     Subscriptions,
     Attachments,
-    Large,
 }
 
 impl View {
-    const ALL: [View; 4] = [
-        View::All,
-        View::Subscriptions,
-        View::Attachments,
-        View::Large,
-    ];
+    const ALL: [View; 3] = [View::All, View::Subscriptions, View::Attachments];
 
     fn index(self) -> usize {
         View::ALL.iter().position(|v| *v == self).unwrap_or(0)
@@ -87,7 +84,6 @@ impl View {
             View::All => "All",
             View::Subscriptions => "Subscriptions",
             View::Attachments => "Attachments",
-            View::Large => "Large",
         }
     }
 
@@ -97,6 +93,32 @@ impl View {
 
     fn prev(self) -> Self {
         View::ALL[(self.index() + View::ALL.len() - 1) % View::ALL.len()]
+    }
+}
+
+/// How the domain/sender/message tree is ordered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    Messages,
+    Size,
+    Recent,
+}
+
+impl SortMode {
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::Messages => "Messages",
+            SortMode::Size => "Size",
+            SortMode::Recent => "Recent",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            SortMode::Messages => SortMode::Size,
+            SortMode::Size => SortMode::Recent,
+            SortMode::Recent => SortMode::Messages,
+        }
     }
 }
 
@@ -144,6 +166,7 @@ struct App {
     /// Message IDs marked for a bulk action.
     marked: HashSet<String>,
     view: View,
+    sort: SortMode,
     groups: Vec<DomainGroup>,
     expanded_domains: HashSet<String>,
     expanded_senders: HashSet<String>,
@@ -163,6 +186,7 @@ impl App {
             attachments: HashMap::new(),
             marked: HashSet::new(),
             view: View::All,
+            sort: SortMode::Messages,
             groups: Vec::new(),
             expanded_domains: HashSet::new(),
             expanded_senders: HashSet::new(),
@@ -185,6 +209,13 @@ impl App {
             ScanEvent::Status(s) => self.sync.message = s,
             ScanEvent::Notice(s) => self.status = s,
             ScanEvent::Removed(ids) => self.remove_messages(&ids),
+            ScanEvent::AttachmentDetails(id, list) => {
+                self.attachments.insert(id, list);
+                // Re-sort so newly-known sizes take effect in the Attachments view.
+                if self.view == View::Attachments && self.sort == SortMode::Size {
+                    self.rebuild_groups();
+                }
+            }
             ScanEvent::Listed(n) => {
                 self.sync.total = n;
                 self.sync.message = format!("Listed {n} messages");
@@ -228,7 +259,7 @@ impl App {
 
     fn filtered_metas(&self) -> Vec<MessageMeta> {
         match self.view {
-            View::All | View::Large => self.metas.clone(),
+            View::All => self.metas.clone(),
             View::Subscriptions => self
                 .metas
                 .iter()
@@ -244,29 +275,41 @@ impl App {
         }
     }
 
+    /// Effective size of a message for sorting/display: in the Attachments view
+    /// this is the actual attachment total once known, otherwise Gmail's
+    /// per-message size estimate.
+    fn msg_size(&self, m: &MessageMeta) -> u64 {
+        if self.view == View::Attachments {
+            if let Some(atts) = self.attachments.get(&m.id) {
+                let total: u64 = atts.iter().map(|a| a.size).sum();
+                if total > 0 {
+                    return total;
+                }
+            }
+        }
+        m.size_estimate
+    }
+
+    fn sender_size(&self, s: &SenderEntry) -> u64 {
+        s.messages.iter().map(|m| self.msg_size(m)).sum()
+    }
+
+    fn domain_size(&self, g: &DomainGroup) -> u64 {
+        g.senders.iter().map(|s| self.sender_size(s)).sum()
+    }
+
     fn rebuild_groups(&mut self) {
         // Preserve the selected node across regroups so it doesn't jump while
         // the tree re-sorts during an incremental sync.
         let anchor = self.selection_key();
-        self.groups = group_messages(&self.filtered_metas());
-        if self.view == View::Large {
-            self.sort_by_size();
-        }
+        let mut groups = group_messages(&self.filtered_metas());
+        let size_of = |m: &MessageMeta| self.msg_size(m);
+        apply_sort(&mut groups, self.sort, &size_of);
+        self.groups = groups;
         match anchor.and_then(|key| self.find_row(&key)) {
             Some(pos) => self.selected = pos,
             None => self.clamp_selection(),
         }
-    }
-
-    /// Re-sort domains/senders/messages by total size (for the Large view).
-    fn sort_by_size(&mut self) {
-        for g in &mut self.groups {
-            for s in &mut g.senders {
-                s.messages.sort_by(|a, b| b.size_estimate.cmp(&a.size_estimate));
-            }
-            g.senders.sort_by(|a, b| b.size().cmp(&a.size()));
-        }
-        self.groups.sort_by(|a, b| b.size().cmp(&a.size()));
     }
 
     fn selection_key(&self) -> Option<SelKey> {
@@ -588,12 +631,13 @@ async fn run_scan(client: GmailClient, tx: UnboundedSender<ScanEvent>) {
     };
     let _ = tx.send(ScanEvent::Listed(ids.len()));
 
-    if let Ok(att) = client
+    let attachment_ids = client
         .list_message_ids(Some("in:inbox has:attachment"), SCAN_LIMIT)
         .await
-    {
-        let _ = tx.send(ScanEvent::AttachmentIds(att.into_iter().collect()));
-    }
+        .unwrap_or_default();
+    let _ = tx.send(ScanEvent::AttachmentIds(
+        attachment_ids.iter().cloned().collect(),
+    ));
 
     let progress_tx = tx.clone();
     let report = client
@@ -619,6 +663,28 @@ async fn run_scan(client: GmailClient, tx: UnboundedSender<ScanEvent>) {
         summary.push_str(&format!(" · ⚠ {}", report.batch_errors[0]));
     }
     let _ = tx.send(ScanEvent::Done(summary));
+
+    // Background: fetch actual attachment filenames/sizes for every attachment
+    // message, paced to stay well under quota. Sizes fill in the Attachments
+    // view (and make Enter instant) as they arrive.
+    let total = attachment_ids.len();
+    for (i, id) in attachment_ids.into_iter().enumerate() {
+        if let Ok(list) = client.message_attachments(&id).await {
+            let _ = tx.send(ScanEvent::AttachmentDetails(id, list));
+        }
+        if i % 25 == 0 {
+            let _ = tx.send(ScanEvent::Notice(format!(
+                "Loading attachment sizes… {}/{total}",
+                i + 1
+            )));
+        }
+        sleep(Duration::from_millis(120)).await;
+    }
+    if total > 0 {
+        let _ = tx.send(ScanEvent::Notice(format!(
+            "Attachment sizes loaded ({total} messages)"
+        )));
+    }
 }
 
 async fn run(
@@ -683,6 +749,11 @@ async fn handle_key(
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
         KeyCode::Char(' ') => app.toggle_mark(),
+        KeyCode::Char('o') => {
+            app.sort = app.sort.next();
+            app.rebuild_groups();
+            app.status = format!("Sort: {}", app.sort.label());
+        }
         KeyCode::Char('c') => {
             app.marked.clear();
             app.status = "Cleared marks".to_string();
@@ -898,11 +969,17 @@ fn tabs_line(active: View) -> Line<'static> {
 }
 
 fn render_domains(f: &mut Frame, app: &App, area: Rect) {
-    let title = if app.marked.is_empty() {
-        format!("2 Domains ({})", app.groups.len())
+    let marked = if app.marked.is_empty() {
+        String::new()
     } else {
-        format!("2 Domains ({} · {} marked)", app.groups.len(), app.marked.len())
+        format!(" · {} marked", app.marked.len())
     };
+    let title = format!(
+        "2 Domains ({}{}) · sort {}",
+        app.groups.len(),
+        marked,
+        app.sort.label()
+    );
     let block = panel_block(app, Panel::Domains, title);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -951,7 +1028,7 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn row_line(app: &App, row: &Row) -> Line<'static> {
-    let large = app.view == View::Large;
+    let show_size = app.sort == SortMode::Size;
     match row {
         Row::Domain(g) => {
             let marker = if app.expanded_domains.contains(&g.domain) {
@@ -961,8 +1038,8 @@ fn row_line(app: &App, row: &Row) -> Line<'static> {
             };
             let mark = app.mark_glyph(&g.message_ids());
             let unsub = if g.unsubscribe.is_some() { " ✉" } else { "" };
-            let size = if large {
-                format!("  ({})", human_bytes(g.size()))
+            let size = if show_size {
+                format!("  ({})", human_bytes(app.domain_size(g)))
             } else {
                 String::new()
             };
@@ -982,8 +1059,8 @@ fn row_line(app: &App, row: &Row) -> Line<'static> {
             let mark = app.mark_glyph(&s.message_ids());
             let unsub = if s.unsubscribe.is_some() { " ✉" } else { "" };
             let who = s.name.clone().unwrap_or_else(|| s.email.clone());
-            let size = if large {
-                format!("  ({})", human_bytes(s.size()))
+            let size = if show_size {
+                format!("  ({})", human_bytes(app.sender_size(s)))
             } else {
                 String::new()
             };
@@ -1001,7 +1078,7 @@ fn row_line(app: &App, row: &Row) -> Line<'static> {
                 "",
                 "",
                 fmt_date_short(m.internal_date),
-                human_bytes(m.size_estimate),
+                human_bytes(app.msg_size(m)),
                 m.subject
             ))
         }
@@ -1112,6 +1189,34 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
             }
             lines
         }
+    }
+}
+
+/// Sort a tree of domains/senders/messages in place by the chosen mode.
+fn apply_sort(groups: &mut [DomainGroup], sort: SortMode, size_of: &impl Fn(&MessageMeta) -> u64) {
+    let sender_size = |s: &SenderEntry| -> u64 { s.messages.iter().map(|m| size_of(m)).sum() };
+    let sender_recent = |s: &SenderEntry| s.messages.iter().map(|m| m.internal_date).max().unwrap_or(0);
+    let domain_size = |g: &DomainGroup| -> u64 { g.senders.iter().map(|s| sender_size(s)).sum() };
+    let domain_recent =
+        |g: &DomainGroup| g.senders.iter().flat_map(|s| &s.messages).map(|m| m.internal_date).max().unwrap_or(0);
+
+    for g in groups.iter_mut() {
+        for s in g.senders.iter_mut() {
+            match sort {
+                SortMode::Size => s.messages.sort_by(|a, b| size_of(b).cmp(&size_of(a))),
+                _ => s.messages.sort_by(|a, b| b.internal_date.cmp(&a.internal_date)),
+            }
+        }
+        match sort {
+            SortMode::Messages => g.senders.sort_by(|a, b| b.count().cmp(&a.count())),
+            SortMode::Size => g.senders.sort_by(|a, b| sender_size(b).cmp(&sender_size(a))),
+            SortMode::Recent => g.senders.sort_by(|a, b| sender_recent(b).cmp(&sender_recent(a))),
+        }
+    }
+    match sort {
+        SortMode::Messages => groups.sort_by(|a, b| b.count().cmp(&a.count())),
+        SortMode::Size => groups.sort_by(|a, b| domain_size(b).cmp(&domain_size(a))),
+        SortMode::Recent => groups.sort_by(|a, b| domain_recent(b).cmp(&domain_recent(a))),
     }
 }
 
