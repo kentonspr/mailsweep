@@ -35,7 +35,7 @@ use mailsweep_core::{
 
 const SCAN_LIMIT: usize = 1000;
 const HELP: &str = "Tab view · j/k move · h/l fold · Space mark · c clear · \
-    Enter attach · a archive · d trash · s spam · u unsub · q quit";
+    Enter attach · a archive · A archive+del · d trash · s spam · u unsub · q quit";
 
 /// Messages streamed from the background scan / archive tasks into the UI.
 enum ScanEvent {
@@ -51,6 +51,8 @@ enum ScanEvent {
     Done(String),
     Failed(String),
     Notice(String),
+    /// Messages removed by a background task (e.g. archive-and-delete).
+    Removed(Vec<String>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -182,6 +184,7 @@ impl App {
             ScanEvent::Account(p) => self.account = Some(p),
             ScanEvent::Status(s) => self.sync.message = s,
             ScanEvent::Notice(s) => self.status = s,
+            ScanEvent::Removed(ids) => self.remove_messages(&ids),
             ScanEvent::Listed(n) => {
                 self.sync.total = n;
                 self.sync.message = format!("Listed {n} messages");
@@ -685,7 +688,8 @@ async fn handle_key(
             app.status = "Cleared marks".to_string();
         }
         KeyCode::Enter => load_attachments(app, client).await,
-        KeyCode::Char('a') => archive(app, client, tx),
+        KeyCode::Char('a') => archive(app, client, tx, false),
+        KeyCode::Char('A') => archive(app, client, tx, true),
         KeyCode::Char('d') => act(app, client, Action::Trash).await,
         KeyCode::Char('s') => act(app, client, Action::Spam).await,
         KeyCode::Char('u') => app.status = unsubscribe(app, client).await,
@@ -709,7 +713,7 @@ async fn load_attachments(app: &mut App, client: &GmailClient) {
     }
 }
 
-fn archive(app: &mut App, client: &GmailClient, tx: &UnboundedSender<ScanEvent>) {
+fn archive(app: &mut App, client: &GmailClient, tx: &UnboundedSender<ScanEvent>, delete_after: bool) {
     let items = app.archive_items();
     if items.is_empty() {
         app.status = "No attachments to archive in selection".to_string();
@@ -726,11 +730,26 @@ fn archive(app: &mut App, client: &GmailClient, tx: &UnboundedSender<ScanEvent>)
         .unwrap_or(0);
     let path = config::archive_dir().join(format!("{account}-{ts}.zip"));
 
-    app.status = format!("Archiving attachments from {} message(s)…", items.len());
+    let verb = if delete_after { "Archiving + deleting" } else { "Archiving" };
+    app.status = format!("{verb} attachments from {} message(s)…", items.len());
     let client = client.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
+        let ids: Vec<String> = items.iter().map(|i| i.message_id.clone()).collect();
         let msg = match archive_attachments(&client, &items, &path).await {
+            Ok(s) if delete_after => match client.trash(&ids).await {
+                Ok(()) => {
+                    let _ = tx.send(ScanEvent::Removed(ids.clone()));
+                    format!(
+                        "Archived {} file(s) ({}) and trashed {} message(s) → {}",
+                        s.files,
+                        human_bytes(s.bytes),
+                        ids.len(),
+                        s.path.display()
+                    )
+                }
+                Err(e) => format!("Archived {} file(s) but trash failed: {e}", s.files),
+            },
             Ok(s) => format!(
                 "Archived {} file(s) ({}) from {} message(s) → {}",
                 s.files,
