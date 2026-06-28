@@ -1,0 +1,4 @@
+/target
+**/client_secret.json
+**/token_cache.json
+*.log

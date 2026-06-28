@@ -1,0 +1,16 @@
+[package]
+name = "mailsweep-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mailsweep"
+path = "src/main.rs"
+
+[dependencies]
+mailsweep-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
