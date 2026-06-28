@@ -26,12 +26,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use mailsweep_core::{
-    archive_attachments, config, group_messages, ArchiveItem, AttachmentInfo, Cache, DomainGroup,
-    FetchProgress, GmailAuth, GmailClient, MailProvider, MessageMeta, Profile, SenderEntry,
-    UnsubscribeInfo,
+    accounts, archive_attachments, config, group_messages, ArchiveItem, AttachmentInfo, Cache,
+    DomainGroup, FetchProgress, GmailAuth, GmailClient, MailProvider, MessageMeta, Profile,
+    SenderEntry, UnsubscribeInfo,
 };
 
 const HELP: &str = "Tab view · o sort · j/k move · h/l fold · Space mark · c clear · \
@@ -55,6 +56,29 @@ enum ScanEvent {
     Removed(Vec<String>),
     /// Actual attachment details for one message (background size fetch).
     AttachmentDetails(String, Vec<AttachmentInfo>),
+}
+
+/// Sends scan events tagged with the account "epoch" they belong to, so events
+/// from a superseded account scan can be ignored after a switch.
+#[derive(Clone)]
+struct Emitter {
+    tx: UnboundedSender<(u64, ScanEvent)>,
+    epoch: u64,
+}
+
+impl Emitter {
+    fn send(&self, event: ScanEvent) {
+        let _ = self.tx.send((self.epoch, event));
+    }
+}
+
+/// What a keypress asks the event loop to do (things needing account/terminal
+/// access beyond mutating `App`).
+enum KeyOutcome {
+    None,
+    Quit,
+    Switch(usize),
+    AddAccount,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -158,6 +182,13 @@ struct SyncState {
 }
 
 struct App {
+    /// Configured account emails; `active` indexes the one being shown.
+    accounts: Vec<String>,
+    active: usize,
+    /// Cursor within the Accounts panel (== accounts.len() means "+ Add").
+    account_cursor: usize,
+    /// Generation of the active account's scan; events from older epochs drop.
+    epoch: u64,
     account: Option<Profile>,
     metas: Vec<MessageMeta>,
     attachment_ids: HashSet<String>,
@@ -179,6 +210,10 @@ struct App {
 impl App {
     fn new() -> Self {
         Self {
+            accounts: Vec::new(),
+            active: 0,
+            account_cursor: 0,
+            epoch: 0,
             account: None,
             metas: Vec::new(),
             attachment_ids: HashSet::new(),
@@ -197,6 +232,36 @@ impl App {
                 ..SyncState::default()
             },
             status: HELP.to_string(),
+        }
+    }
+
+    /// Clear per-account state when switching accounts (keeps account list/focus).
+    fn reset_for_account(&mut self) {
+        self.account = None;
+        self.metas.clear();
+        self.attachment_ids.clear();
+        self.attachments.clear();
+        self.marked.clear();
+        self.groups.clear();
+        self.expanded_domains.clear();
+        self.expanded_senders.clear();
+        self.selected = 0;
+        self.detail_scroll = 0;
+        self.sync = SyncState {
+            message: "Starting…".to_string(),
+            ..SyncState::default()
+        };
+        self.status = HELP.to_string();
+    }
+
+    /// Activated Enter in the Accounts panel: switch or add.
+    fn account_enter(&self) -> KeyOutcome {
+        if self.account_cursor >= self.accounts.len() {
+            KeyOutcome::AddAccount
+        } else if self.account_cursor == self.active {
+            KeyOutcome::None
+        } else {
+            KeyOutcome::Switch(self.account_cursor)
         }
     }
 
@@ -354,24 +419,33 @@ impl App {
     // ---- navigation ---------------------------------------------------------
 
     fn move_down(&mut self) {
-        if self.focus == Panel::Details {
-            self.detail_scroll = self.detail_scroll.saturating_add(1);
-            return;
-        }
-        let n = self.rows().len();
-        if n > 0 {
-            self.selected = (self.selected + 1).min(n - 1);
-            self.detail_scroll = 0;
+        match self.focus {
+            Panel::Details => self.detail_scroll = self.detail_scroll.saturating_add(1),
+            Panel::Accounts => {
+                // Range 0..=accounts.len(); the last row is "+ Add account".
+                if self.account_cursor < self.accounts.len() {
+                    self.account_cursor += 1;
+                }
+            }
+            Panel::Domains => {
+                let n = self.rows().len();
+                if n > 0 {
+                    self.selected = (self.selected + 1).min(n - 1);
+                    self.detail_scroll = 0;
+                }
+            }
         }
     }
 
     fn move_up(&mut self) {
-        if self.focus == Panel::Details {
-            self.detail_scroll = self.detail_scroll.saturating_sub(1);
-            return;
+        match self.focus {
+            Panel::Details => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+            Panel::Accounts => self.account_cursor = self.account_cursor.saturating_sub(1),
+            Panel::Domains => {
+                self.selected = self.selected.saturating_sub(1);
+                self.detail_scroll = 0;
+            }
         }
-        self.selected = self.selected.saturating_sub(1);
-        self.detail_scroll = 0;
     }
 
     fn node(&self) -> Option<Node> {
@@ -594,30 +668,120 @@ impl App {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (client, cache) = setup()?;
-    let (tx, rx) = mpsc::unbounded_channel();
-    let scan_client = client.clone();
-    let scan_tx = tx.clone();
-    tokio::spawn(async move { run_scan(scan_client, cache, scan_tx).await });
-    run(client, rx, tx).await
+    let _ = accounts::migrate_legacy_if_needed().await;
+    let mut emails = accounts::list_accounts();
+    if emails.is_empty() {
+        println!("No accounts configured. Opening your browser to authorize the first account…");
+        let email = accounts::add_account().await?;
+        println!("Authorized {email}.");
+        emails = vec![email];
+    }
+    run_app(emails).await
 }
 
-fn setup() -> Result<(GmailClient, Cache)> {
-    let auth = GmailAuth::new(config::secret_path(), config::token_cache_path(), config::SCOPES);
-    let cache = Cache::open(config::cache_path())?;
+/// A configured account and its live client + cache.
+struct AccountCtx {
+    email: String,
+    client: GmailClient,
+    cache: Cache,
+}
+
+fn build_account(email: &str) -> Result<AccountCtx> {
+    let auth = GmailAuth::new(config::secret_path(), accounts::token_path(email), config::SCOPES);
+    let cache = Cache::open(accounts::cache_path(email))?;
     let client = GmailClient::new(Arc::new(auth)).with_cache(cache.clone());
-    Ok((client, cache))
+    Ok(AccountCtx {
+        email: email.to_string(),
+        client,
+        cache,
+    })
 }
 
-async fn run_scan(client: GmailClient, cache: Cache, tx: UnboundedSender<ScanEvent>) {
-    let _ = tx.send(ScanEvent::Status("Authenticating…".to_string()));
+fn spawn_scan(epoch: u64, ctx: &AccountCtx, tx: &UnboundedSender<(u64, ScanEvent)>) -> JoinHandle<()> {
+    let em = Emitter {
+        tx: tx.clone(),
+        epoch,
+    };
+    let client = ctx.client.clone();
+    let cache = ctx.cache.clone();
+    tokio::spawn(async move { run_scan(em, client, cache).await })
+}
+
+async fn run_app(emails: Vec<String>) -> Result<()> {
+    let mut accounts_ctx: Vec<AccountCtx> = Vec::new();
+    for email in &emails {
+        match build_account(email) {
+            Ok(ctx) => accounts_ctx.push(ctx),
+            Err(e) => eprintln!("Skipping account {email}: {e}"),
+        }
+    }
+    if accounts_ctx.is_empty() {
+        anyhow::bail!("no usable accounts");
+    }
+
+    let (tx, rx) = mpsc::unbounded_channel::<(u64, ScanEvent)>();
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+
+    let mut app = App::new();
+    app.accounts = accounts_ctx.iter().map(|c| c.email.clone()).collect();
+    app.active = 0;
+    app.account_cursor = 0;
+
+    let mut epoch = 1u64;
+    app.epoch = epoch;
+    let mut handle = spawn_scan(epoch, &accounts_ctx[0], &tx);
+
+    let result = event_loop(
+        &mut terminal,
+        &mut accounts_ctx,
+        &mut app,
+        &mut epoch,
+        &mut handle,
+        &tx,
+        rx,
+    )
+    .await;
+
+    handle.abort();
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    result
+}
+
+fn switch_account(
+    i: usize,
+    accounts_ctx: &[AccountCtx],
+    app: &mut App,
+    epoch: &mut u64,
+    handle: &mut JoinHandle<()>,
+    tx: &UnboundedSender<(u64, ScanEvent)>,
+) {
+    if i >= accounts_ctx.len() {
+        return;
+    }
+    handle.abort();
+    *epoch += 1;
+    app.reset_for_account();
+    app.active = i;
+    app.account_cursor = i;
+    app.epoch = *epoch;
+    *handle = spawn_scan(*epoch, &accounts_ctx[i], tx);
+}
+
+async fn run_scan(em: Emitter, client: GmailClient, cache: Cache) {
+    em.send(ScanEvent::Status("Authenticating…".to_string()));
     let profile = match client.profile().await {
         Ok(p) => {
-            let _ = tx.send(ScanEvent::Account(p.clone()));
+            em.send(ScanEvent::Account(p.clone()));
             p
         }
         Err(e) => {
-            let _ = tx.send(ScanEvent::Failed(e.to_string()));
+            em.send(ScanEvent::Failed(e.to_string()));
             return;
         }
     };
@@ -626,24 +790,21 @@ async fn run_scan(client: GmailClient, cache: Cache, tx: UnboundedSender<ScanEve
     // otherwise a full inbox scan.
     let mut did_incremental = false;
     if let Ok(Some(start)) = cache.get_state("history_id").await {
-        match sync_incremental(&client, &cache, &tx, &start).await {
+        match sync_incremental(&em, &client, &cache, &start).await {
             Ok(true) => did_incremental = true,
             Ok(false) => {} // history expired → full sync
-            Err(e) => {
-                let _ = tx.send(ScanEvent::Status(format!(
-                    "Incremental sync failed ({e}); doing full sync"
-                )));
-            }
+            Err(e) => em.send(ScanEvent::Status(format!(
+                "Incremental sync failed ({e}); doing full sync"
+            ))),
         }
     }
     if !did_incremental {
-        if let Err(e) = sync_full(&client, &tx).await {
-            let _ = tx.send(ScanEvent::Failed(e.to_string()));
+        if let Err(e) = sync_full(&em, &client).await {
+            em.send(ScanEvent::Failed(e.to_string()));
             return;
         }
     }
-    // Save the checkpoint captured at the start of this run (so anything that
-    // changed during the sync is picked up next time).
+    // Save the checkpoint captured at the start of this run.
     let _ = cache.set_state("history_id", &profile.history_id).await;
 
     // Attachments view data + background actual sizes (shared by both paths).
@@ -652,17 +813,17 @@ async fn run_scan(client: GmailClient, cache: Cache, tx: UnboundedSender<ScanEve
         .list_message_ids(Some("in:inbox has:attachment"), limit)
         .await
         .unwrap_or_default();
-    let _ = tx.send(ScanEvent::AttachmentIds(
+    em.send(ScanEvent::AttachmentIds(
         attachment_ids.iter().cloned().collect(),
     ));
 
     let total = attachment_ids.len();
     for (i, id) in attachment_ids.into_iter().enumerate() {
         if let Ok(list) = client.message_attachments(&id).await {
-            let _ = tx.send(ScanEvent::AttachmentDetails(id, list));
+            em.send(ScanEvent::AttachmentDetails(id, list));
         }
         if i % 25 == 0 {
-            let _ = tx.send(ScanEvent::Notice(format!(
+            em.send(ScanEvent::Notice(format!(
                 "Loading attachment sizes… {}/{total}",
                 i + 1
             )));
@@ -670,23 +831,23 @@ async fn run_scan(client: GmailClient, cache: Cache, tx: UnboundedSender<ScanEve
         sleep(Duration::from_millis(120)).await;
     }
     if total > 0 {
-        let _ = tx.send(ScanEvent::Notice(format!(
+        em.send(ScanEvent::Notice(format!(
             "Attachment sizes loaded ({total} messages)"
         )));
     }
 }
 
 /// Full inbox scan: list every message, fetch metadata (cache-aware).
-async fn sync_full(client: &GmailClient, tx: &UnboundedSender<ScanEvent>) -> Result<()> {
+async fn sync_full(em: &Emitter, client: &GmailClient) -> Result<()> {
     let limit = config::scan_limit();
-    let _ = tx.send(ScanEvent::Status("Listing inbox…".to_string()));
+    em.send(ScanEvent::Status("Listing inbox…".to_string()));
     let ids = client.list_message_ids(Some("in:inbox"), limit).await?;
-    let _ = tx.send(ScanEvent::Listed(ids.len()));
+    em.send(ScanEvent::Listed(ids.len()));
 
-    let ptx = tx.clone();
+    let em2 = em.clone();
     let report = client
         .fetch_metadata_with(&ids, |p: FetchProgress, batch: &[MessageMeta]| {
-            let _ = ptx.send(ScanEvent::Progress {
+            em2.send(ScanEvent::Progress {
                 resolved: p.resolved,
                 total: p.total,
                 metas: batch.to_vec(),
@@ -699,23 +860,23 @@ async fn sync_full(client: &GmailClient, tx: &UnboundedSender<ScanEvent>) -> Res
     if !report.batch_errors.is_empty() {
         summary.push_str(&format!(" · ⚠ {}", report.batch_errors[0]));
     }
-    let _ = tx.send(ScanEvent::Done(summary));
+    em.send(ScanEvent::Done(summary));
     Ok(())
 }
 
 /// Incremental sync: rebuild the current inbox from the cache plus the
 /// adds/removes since `start`. Returns `Ok(false)` if the history expired.
 async fn sync_incremental(
+    em: &Emitter,
     client: &GmailClient,
     cache: &Cache,
-    tx: &UnboundedSender<ScanEvent>,
     start: &str,
 ) -> Result<bool> {
     let delta = match client.history_since(start).await? {
         Some(d) => d,
         None => return Ok(false),
     };
-    let _ = tx.send(ScanEvent::Status("Incremental sync…".to_string()));
+    em.send(ScanEvent::Status("Incremental sync…".to_string()));
 
     let mut base = cache.all().await.unwrap_or_default();
     let removed_n = delta.removed.len();
@@ -738,17 +899,17 @@ async fn sync_incremental(
     let fetch_n = to_fetch.len();
 
     // Show the cached set instantly, then stream in the new messages.
-    let _ = tx.send(ScanEvent::Progress {
+    em.send(ScanEvent::Progress {
         resolved: base_n,
         total: base_n + fetch_n,
         metas: base,
     });
 
     if fetch_n > 0 {
-        let ptx = tx.clone();
+        let em2 = em.clone();
         client
             .fetch_metadata_with(&to_fetch, |p: FetchProgress, batch: &[MessageMeta]| {
-                let _ = ptx.send(ScanEvent::Progress {
+                em2.send(ScanEvent::Progress {
                     resolved: base_n + p.resolved,
                     total: base_n + fetch_n,
                     metas: batch.to_vec(),
@@ -757,48 +918,47 @@ async fn sync_incremental(
             .await?;
     }
 
-    let _ = tx.send(ScanEvent::Done(format!(
+    em.send(ScanEvent::Done(format!(
         "Incremental · {base_n} cached · {fetch_n} new · {removed_n} removed"
     )));
     Ok(true)
 }
 
-async fn run(
-    client: GmailClient,
-    mut rx: UnboundedReceiver<ScanEvent>,
-    tx: UnboundedSender<ScanEvent>,
-) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let mut app = App::new();
-
-    let result = event_loop(&mut terminal, &client, &tx, &mut app, &mut rx).await;
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
-}
-
-async fn event_loop<B: Backend>(
+#[allow(clippy::too_many_arguments)]
+async fn event_loop<B: Backend + io::Write>(
     terminal: &mut Terminal<B>,
-    client: &GmailClient,
-    tx: &UnboundedSender<ScanEvent>,
+    accounts_ctx: &mut Vec<AccountCtx>,
     app: &mut App,
-    rx: &mut UnboundedReceiver<ScanEvent>,
+    epoch: &mut u64,
+    handle: &mut JoinHandle<()>,
+    tx: &UnboundedSender<(u64, ScanEvent)>,
+    mut rx: UnboundedReceiver<(u64, ScanEvent)>,
 ) -> Result<()> {
     loop {
-        while let Ok(event) = rx.try_recv() {
-            app.apply(event);
+        while let Ok((ep, event)) = rx.try_recv() {
+            if ep == app.epoch {
+                app.apply(event);
+            }
         }
         terminal.draw(|f| ui(f, app))?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && handle_key(app, client, tx, key.code).await? {
-                    break;
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                let client = accounts_ctx[app.active].client.clone();
+                let em = Emitter {
+                    tx: tx.clone(),
+                    epoch: *epoch,
+                };
+                match handle_key(app, &client, &em, key.code).await {
+                    KeyOutcome::Quit => break,
+                    KeyOutcome::None => {}
+                    KeyOutcome::Switch(i) => switch_account(i, accounts_ctx, app, epoch, handle, tx),
+                    KeyOutcome::AddAccount => {
+                        add_account_flow(terminal, accounts_ctx, app, epoch, handle, tx).await?;
+                    }
                 }
             }
         }
@@ -806,15 +966,56 @@ async fn event_loop<B: Backend>(
     Ok(())
 }
 
-/// Returns `Ok(true)` when the user asked to quit.
+/// Suspend the TUI, run the browser OAuth flow, then resume and switch to the
+/// newly-added account.
+async fn add_account_flow<B: Backend + io::Write>(
+    terminal: &mut Terminal<B>,
+    accounts_ctx: &mut Vec<AccountCtx>,
+    app: &mut App,
+    epoch: &mut u64,
+    handle: &mut JoinHandle<()>,
+    tx: &UnboundedSender<(u64, ScanEvent)>,
+) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    println!("\nOpening your browser to authorize a new account…");
+
+    let result = accounts::add_account().await;
+
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    match result {
+        Ok(email) => {
+            if let Some(i) = accounts_ctx.iter().position(|c| c.email == email) {
+                switch_account(i, accounts_ctx, app, epoch, handle, tx);
+                app.status = format!("Account {email} already added");
+            } else {
+                match build_account(&email) {
+                    Ok(ctx) => {
+                        accounts_ctx.push(ctx);
+                        app.accounts.push(email.clone());
+                        switch_account(accounts_ctx.len() - 1, accounts_ctx, app, epoch, handle, tx);
+                        app.status = format!("Added {email}");
+                    }
+                    Err(e) => app.status = format!("Add account failed: {e}"),
+                }
+            }
+        }
+        Err(e) => app.status = format!("Add account failed: {e}"),
+    }
+    Ok(())
+}
+
 async fn handle_key(
     app: &mut App,
     client: &GmailClient,
-    tx: &UnboundedSender<ScanEvent>,
+    em: &Emitter,
     code: KeyCode,
-) -> Result<bool> {
+) -> KeyOutcome {
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+        KeyCode::Char('q') | KeyCode::Esc => return KeyOutcome::Quit,
         KeyCode::Char('1') => app.focus = Panel::Accounts,
         KeyCode::Char('2') => app.focus = Panel::Domains,
         KeyCode::Char('3') => app.focus = Panel::Details,
@@ -834,15 +1035,20 @@ async fn handle_key(
             app.marked.clear();
             app.status = "Cleared marks".to_string();
         }
-        KeyCode::Enter => load_attachments(app, client).await,
-        KeyCode::Char('a') => archive(app, client, tx, false),
-        KeyCode::Char('A') => archive(app, client, tx, true),
+        KeyCode::Enter => {
+            if app.focus == Panel::Accounts {
+                return app.account_enter();
+            }
+            load_attachments(app, client).await;
+        }
+        KeyCode::Char('a') => archive(app, client, em, false),
+        KeyCode::Char('A') => archive(app, client, em, true),
         KeyCode::Char('d') => act(app, client, Action::Trash).await,
         KeyCode::Char('s') => act(app, client, Action::Spam).await,
         KeyCode::Char('u') => app.status = unsubscribe(app, client).await,
         _ => {}
     }
-    Ok(false)
+    KeyOutcome::None
 }
 
 async fn load_attachments(app: &mut App, client: &GmailClient) {
@@ -860,7 +1066,7 @@ async fn load_attachments(app: &mut App, client: &GmailClient) {
     }
 }
 
-fn archive(app: &mut App, client: &GmailClient, tx: &UnboundedSender<ScanEvent>, delete_after: bool) {
+fn archive(app: &mut App, client: &GmailClient, em: &Emitter, delete_after: bool) {
     let items = app.archive_items();
     if items.is_empty() {
         app.status = "No attachments to archive in selection".to_string();
@@ -880,13 +1086,13 @@ fn archive(app: &mut App, client: &GmailClient, tx: &UnboundedSender<ScanEvent>,
     let verb = if delete_after { "Archiving + deleting" } else { "Archiving" };
     app.status = format!("{verb} attachments from {} message(s)…", items.len());
     let client = client.clone();
-    let tx = tx.clone();
+    let em = em.clone();
     tokio::spawn(async move {
         let ids: Vec<String> = items.iter().map(|i| i.message_id.clone()).collect();
         let msg = match archive_attachments(&client, &items, &path).await {
             Ok(s) if delete_after => match client.trash(&ids).await {
                 Ok(()) => {
-                    let _ = tx.send(ScanEvent::Removed(ids.clone()));
+                    em.send(ScanEvent::Removed(ids.clone()));
                     format!(
                         "Archived {} file(s) ({}) and trashed {} message(s) → {}",
                         s.files,
@@ -906,7 +1112,7 @@ fn archive(app: &mut App, client: &GmailClient, tx: &UnboundedSender<ScanEvent>,
             ),
             Err(e) => format!("Archive failed: {e}"),
         };
-        let _ = tx.send(ScanEvent::Notice(msg));
+        em.send(ScanEvent::Notice(msg));
     });
 }
 
@@ -972,8 +1178,10 @@ async fn unsubscribe(app: &App, client: &GmailClient) -> String {
 // ---- rendering --------------------------------------------------------------
 
 fn ui(f: &mut Frame, app: &App) {
+    // Accounts panel: borders (2) + one row per account + add row + sync line.
+    let accounts_height = (app.accounts.len() as u16 + 4).clamp(5, 12);
     let rows = Layout::vertical([
-        Constraint::Length(5),
+        Constraint::Length(accounts_height),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
@@ -1002,27 +1210,53 @@ fn panel_block(app: &App, panel: Panel, title: impl Into<String>) -> Block<'stat
 }
 
 fn render_accounts(f: &mut Frame, app: &App, area: Rect) {
-    let mut lines = match &app.account {
-        Some(p) => vec![
-            Line::from(Span::styled(
-                format!("▶ {}", p.email),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(format!(
-                "{} messages · {} threads in mailbox",
-                p.messages_total, p.threads_total
-            )),
-        ],
-        None => vec![Line::from("Loading account…")],
-    };
-    lines.push(Line::from(Span::styled(
-        format!("Sync: {}", app.sync.message),
-        Style::default().fg(Color::Cyan),
-    )));
+    let block = panel_block(app, Panel::Accounts, "[1] Accounts");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+
+    // One row per account, plus a "+ Add account" row.
+    let mut items: Vec<ListItem> = app
+        .accounts
+        .iter()
+        .enumerate()
+        .map(|(i, email)| {
+            let active = i == app.active;
+            let marker = if active { "●" } else { " " };
+            let totals = match (active, &app.account) {
+                (true, Some(p)) => format!("  ({} msgs)", p.messages_total),
+                _ => String::new(),
+            };
+            let style = if active {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("{marker} {email}{totals}"),
+                style,
+            )))
+        })
+        .collect();
+    items.push(ListItem::new(Line::from(Span::styled(
+        "[+ Add account]",
+        Style::default().fg(Color::Green),
+    ))));
+
+    let mut state = ListState::default();
+    if app.focus == Panel::Accounts {
+        state.select(Some(app.account_cursor.min(items.len() - 1)));
+    }
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, rows[0], &mut state);
 
     f.render_widget(
-        Paragraph::new(lines).block(panel_block(app, Panel::Accounts, "[1] Accounts")),
-        area,
+        Paragraph::new(Span::styled(
+            format!("Sync: {}", app.sync.message),
+            Style::default().fg(Color::Cyan),
+        )),
+        rows[1],
     );
 }
 

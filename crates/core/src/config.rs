@@ -43,6 +43,11 @@ pub fn archive_dir() -> PathBuf {
     config_dir().join("archives")
 }
 
+/// Directory holding per-account state (tokens, caches), one subdir each.
+pub fn accounts_dir() -> PathBuf {
+    config_dir().join("accounts")
+}
+
 /// Maximum number of messages to scan.
 ///
 /// Defaults to no limit (the whole inbox). Override with the

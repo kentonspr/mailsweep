@@ -17,6 +17,18 @@ crates/
   gui/    iced desktop frontend       (binary: mailsweep-gui)
 ```
 
+## Multiple accounts
+
+Each account gets its own token cache, metadata cache, and `historyId`, all
+under `~/.config/mailsweep/accounts/<email>/`, and all share the one OAuth client
+you set up below. Focus the Accounts panel (`1`), move with `j`/`k`, and press
+`Enter` on `[+ Add account]` to authorize another Gmail account in your browser;
+`Enter` on an account switches to it. An existing single-account setup is
+migrated automatically on first launch.
+
+Note: while your OAuth client is in "testing" mode, every Gmail account you add
+must be listed as a **test user** in your Cloud project (see below).
+
 ## One-time Google setup
 
 1. In the [Google Cloud Console](https://console.cloud.google.com/), create a
@@ -49,7 +61,8 @@ First launch opens a browser for consent; the token is cached to
 
 ### Keys (TUI)
 
-- `1`/`2`/`3` — focus the Accounts / Domains / Details panel
+- `1`/`2`/`3` — focus the Accounts / Domains / Details panel; in the Accounts
+  panel, `j`/`k` move and `Enter` switches account (or `[+ Add account]`)
 - `Tab` / `Shift-Tab` — switch domain view (All / Subscriptions / Attachments)
 - `o` — cycle sort (Messages / Size / Recent), applied to the current view
 - `j`/`k` (or `↑`/`↓`) — move within the focused panel (or scroll Details)

@@ -1,6 +1,7 @@
 //! Shared core for Mailsweep: OAuth, the Gmail provider, message grouping,
 //! and unsubscribe handling. Frontends (TUI / GUI) build on top of this.
 
+pub mod accounts;
 pub mod archive;
 pub mod auth;
 pub mod cache;
