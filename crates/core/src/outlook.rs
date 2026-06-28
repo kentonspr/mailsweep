@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
+use crate::auth::AuthPrompt;
 use crate::cache::Cache;
 use crate::gmail::{AttachmentInfo, FetchProgress, FetchReport, Profile};
 use crate::model::MessageMeta;
@@ -111,9 +112,10 @@ impl MsAuth {
         Ok(resp.access_token)
     }
 
-    /// Run the interactive device-code flow, printing the code/URL to stdout
-    /// and polling until the user completes sign-in. Saves the refresh token.
-    pub async fn device_login(&self) -> Result<()> {
+    /// Run the interactive device-code flow, reporting the URL/code via
+    /// `on_prompt` and polling until the user completes sign-in. Saves the
+    /// refresh token.
+    pub async fn device_login(&self, on_prompt: &(dyn Fn(AuthPrompt) + Send + Sync)) -> Result<()> {
         let code: DeviceCodeResp = self
             .http
             .post(format!("{AUTH}/devicecode"))
@@ -128,7 +130,11 @@ impl MsAuth {
             .json()
             .await?;
 
-        println!("\n{}\n", code.message);
+        on_prompt(AuthPrompt::DeviceCode {
+            verification_uri: code.verification_uri.clone(),
+            user_code: code.user_code.clone(),
+            message: code.message.clone(),
+        });
 
         let deadline = Instant::now() + Duration::from_secs(code.expires_in.max(60));
         let mut interval = Duration::from_secs(code.interval.max(1));
@@ -190,6 +196,10 @@ struct TokenError {
 #[serde(rename_all = "snake_case")]
 struct DeviceCodeResp {
     device_code: String,
+    #[serde(default)]
+    user_code: String,
+    #[serde(default)]
+    verification_uri: String,
     message: String,
     #[serde(default)]
     expires_in: u64,

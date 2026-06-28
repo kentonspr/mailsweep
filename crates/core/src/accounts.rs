@@ -8,16 +8,23 @@
 //! accounts/<sanitized-email>/metadata.sqlite3   # message cache + sync token
 //! ```
 
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use yup_oauth2::authenticator_delegate::InstalledFlowDelegate;
+use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 
-use crate::auth::GmailAuth;
+use crate::auth::{AuthPrompt, GmailAuth};
 use crate::config;
 use crate::gmail::GmailClient;
 use crate::outlook::{MsAuth, OutlookClient};
 use crate::provider::MailProvider;
+
+/// Callback the add-account flow uses to surface sign-in prompts to the UI.
+pub type PromptFn = Arc<dyn Fn(AuthPrompt) + Send + Sync>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Provider {
@@ -120,9 +127,46 @@ fn persist_account(email: &str, provider: Provider, pending_token: &PathBuf) -> 
     Ok(())
 }
 
-/// Run the sign-in flow for a new account of `provider`. Blocks on user consent
-/// (browser for Gmail, device code for Outlook). Returns the account email.
-pub async fn add_account(provider: Provider) -> Result<String> {
+/// An `InstalledFlowDelegate` that opens the browser and reports the consent
+/// URL to the UI instead of printing to stdout (which would corrupt the TUI).
+struct BrowserDelegate {
+    on_prompt: PromptFn,
+}
+
+impl InstalledFlowDelegate for BrowserDelegate {
+    fn present_user_url<'a>(
+        &'a self,
+        url: &'a str,
+        _need_code: bool,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<String, String>> + Send + 'a>> {
+        let on_prompt = self.on_prompt.clone();
+        let url = url.to_string();
+        Box::pin(async move {
+            let _ = open::that(&url);
+            on_prompt(AuthPrompt::Browser { url });
+            Ok(String::new())
+        })
+    }
+}
+
+async fn gmail_consent(token_path: &Path, on_prompt: PromptFn) -> Result<()> {
+    let secret = yup_oauth2::read_application_secret(config::secret_path())
+        .await
+        .context("reading Gmail client secret (configure it first)")?;
+    let auth = InstalledFlowAuthenticator::builder(secret, InstalledFlowReturnMethod::HTTPRedirect)
+        .persist_tokens_to_disk(token_path.to_path_buf())
+        .flow_delegate(Box::new(BrowserDelegate { on_prompt }))
+        .build()
+        .await
+        .context("building authenticator")?;
+    let scopes: Vec<&str> = config::SCOPES.to_vec();
+    auth.token(&scopes).await.context("authorizing Gmail")?;
+    Ok(())
+}
+
+/// Run the sign-in flow for a new account of `provider`, reporting prompts via
+/// `on_prompt`. Returns the account email.
+pub async fn add_account(provider: Provider, on_prompt: PromptFn) -> Result<String> {
     let pending = config::accounts_dir().join(".pending");
     std::fs::create_dir_all(&pending).ok();
     let pending_token = pending.join("token.json");
@@ -130,19 +174,18 @@ pub async fn add_account(provider: Provider) -> Result<String> {
 
     let email = match provider {
         Provider::Gmail => {
+            gmail_consent(&pending_token, on_prompt).await?;
             let auth =
                 GmailAuth::new(config::secret_path(), pending_token.clone(), config::SCOPES);
-            let client = GmailClient::new(Arc::new(auth));
-            client.profile().await?.email
+            GmailClient::new(Arc::new(auth)).profile().await?.email
         }
         Provider::Outlook => {
             let client_id = config::ms_client_id().context(
-                "set MAILSWEEP_MS_CLIENT_ID (or ~/.config/mailsweep/ms_client_id) to your Azure app id",
+                "set your Azure app id (Outlook) before adding the account",
             )?;
             let auth = MsAuth::new(client_id, pending_token.clone());
-            auth.device_login().await?;
-            let client = OutlookClient::new(Arc::new(auth));
-            client.profile().await?.email
+            auth.device_login(on_prompt.as_ref()).await?;
+            OutlookClient::new(Arc::new(auth)).profile().await?.email
         }
     };
 

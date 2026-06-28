@@ -13,7 +13,7 @@ pub mod provider;
 pub mod unsubscribe;
 
 pub use archive::{archive_attachments, ArchiveItem, ArchiveSummary};
-pub use auth::GmailAuth;
+pub use auth::{AuthPrompt, GmailAuth};
 pub use cache::Cache;
 pub use gmail::{
     AttachmentInfo, FetchProgress, FetchReport, GmailClient, HistoryDelta, Profile,

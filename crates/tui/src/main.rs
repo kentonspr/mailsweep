@@ -1,12 +1,12 @@
 //! Ratatui frontend for Mailsweep.
 //!
-//! Streams the inbox sync into a domain → sender → message tree. Three numbered
-//! panels (Accounts, Domains, Details); the Domains panel has tabbed views
-//! (All / Subscriptions / Attachments).
+//! Streams the inbox sync into a domain → sender → message tree. Panels:
+//! `1` Accounts · `2` Config · `3` Domains · `4` Details. Adding an account and
+//! entering provider credentials happen in an in-app modal wizard.
 //!
-//! Keys: `1`/`2`/`3` focus · `Tab`/`Shift-Tab` switch view · `j`/`k` move ·
-//! `h`/`l` collapse/expand · `Enter` load attachments · `a` archive
-//! attachments · `d` trash · `s` spam · `u` unsubscribe · `q` quit.
+//! Keys: `Tab`/`Shift-Tab` switch view · `o` sort · `j`/`k` move · `h`/`l`
+//! collapse/expand · `Space` mark · `Enter` load attachments · `a` archive ·
+//! `A` archive+delete · `d` trash · `s` spam · `u` unsubscribe · `q` quit.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -23,7 +23,9 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -31,8 +33,8 @@ use tokio::time::sleep;
 
 use mailsweep_core::outlook::{MsAuth, OutlookClient};
 use mailsweep_core::{
-    accounts, archive_attachments, config, group_messages, ArchiveItem, AttachmentInfo, Cache,
-    DomainGroup, FetchProgress, GmailAuth, GmailClient, MailProvider, MessageMeta, Profile,
+    accounts, archive_attachments, config, group_messages, ArchiveItem, AttachmentInfo, AuthPrompt,
+    Cache, DomainGroup, FetchProgress, GmailAuth, GmailClient, MailProvider, MessageMeta, Profile,
     SenderEntry, SyncResult, UnsubscribeInfo,
 };
 
@@ -57,6 +59,10 @@ enum ScanEvent {
     Removed(Vec<String>),
     /// Actual attachment details for one message (background size fetch).
     AttachmentDetails(String, Vec<AttachmentInfo>),
+    /// A sign-in prompt to show in the add-account modal.
+    AuthPrompt(Vec<String>),
+    /// Sign-in finished: the new account email, or an error.
+    AuthDone(accounts::Provider, Result<String, String>),
 }
 
 /// Sends scan events tagged with the account "epoch" they belong to, so events
@@ -80,13 +86,66 @@ enum KeyOutcome {
     Quit,
     Switch(usize),
     AddAccount(accounts::Provider),
+    StartAuth(accounts::Provider),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Panel {
     Accounts,
+    Config,
     Domains,
     Details,
+}
+
+/// Add-account wizard overlay.
+struct Modal {
+    state: ModalState,
+}
+
+enum ModalState {
+    /// Entering a provider credential (path or pasted value).
+    Credential {
+        provider: accounts::Provider,
+        input: String,
+        error: Option<String>,
+        /// Continue to sign-in after saving (vs. just storing the credential).
+        then_auth: bool,
+    },
+    /// Sign-in is running; `lines` are the current prompt/status.
+    Working {
+        provider: accounts::Provider,
+        lines: Vec<String>,
+    },
+    /// Final message; dismiss with Enter/Esc.
+    Message(String),
+}
+
+impl Modal {
+    fn credential(provider: accounts::Provider, then_auth: bool) -> Self {
+        Modal {
+            state: ModalState::Credential {
+                provider,
+                input: String::new(),
+                error: None,
+                then_auth,
+            },
+        }
+    }
+
+    fn working(provider: accounts::Provider) -> Self {
+        Modal {
+            state: ModalState::Working {
+                provider,
+                lines: vec!["Starting sign-in…".to_string()],
+            },
+        }
+    }
+
+    fn message(text: String) -> Self {
+        Modal {
+            state: ModalState::Message(text),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -206,6 +265,8 @@ struct App {
     focus: Panel,
     sync: SyncState,
     status: String,
+    /// Add-account wizard, when open.
+    modal: Option<Modal>,
 }
 
 impl App {
@@ -233,6 +294,7 @@ impl App {
                 ..SyncState::default()
             },
             status: HELP.to_string(),
+            modal: None,
         }
     }
 
@@ -286,6 +348,16 @@ impl App {
                     self.rebuild_groups();
                 }
             }
+            ScanEvent::AuthPrompt(new_lines) => {
+                if let Some(Modal {
+                    state: ModalState::Working { lines, .. },
+                }) = &mut self.modal
+                {
+                    *lines = new_lines;
+                }
+            }
+            // Handled in the event loop (needs account context).
+            ScanEvent::AuthDone(..) => {}
             ScanEvent::Listed(n) => {
                 self.sync.total = n;
                 self.sync.message = format!("Listed {n} messages");
@@ -440,6 +512,7 @@ impl App {
                     self.detail_scroll = 0;
                 }
             }
+            Panel::Config => {}
         }
     }
 
@@ -451,6 +524,7 @@ impl App {
                 self.selected = self.selected.saturating_sub(1);
                 self.detail_scroll = 0;
             }
+            Panel::Config => {}
         }
     }
 
@@ -679,7 +753,15 @@ async fn main() -> Result<()> {
     let mut list = accounts::list_accounts();
     if list.is_empty() {
         println!("No accounts configured. Authorizing your first (Gmail) account…");
-        let email = accounts::add_account(accounts::Provider::Gmail).await?;
+        let on_prompt: accounts::PromptFn = Arc::new(|p| match p {
+            AuthPrompt::Browser { url } => println!("Open this URL to authorize:\n  {url}"),
+            AuthPrompt::DeviceCode {
+                verification_uri,
+                user_code,
+                ..
+            } => println!("Visit {verification_uri} and enter code {user_code}"),
+        });
+        let email = accounts::add_account(accounts::Provider::Gmail, on_prompt).await?;
         println!("Authorized {email}.");
         list = vec![accounts::Account {
             email,
@@ -933,8 +1015,17 @@ async fn event_loop<B: Backend + io::Write>(
 ) -> Result<()> {
     loop {
         while let Ok((ep, event)) = rx.try_recv() {
-            if ep == app.epoch {
-                app.apply(event);
+            match event {
+                // Auth events are not account-scoped; always handle them.
+                ScanEvent::AuthDone(provider, res) => {
+                    handle_auth_done(provider, res, accounts_ctx, app, epoch, handle, tx)
+                }
+                ScanEvent::AuthPrompt(_) => app.apply(event),
+                other => {
+                    if ep == app.epoch {
+                        app.apply(other);
+                    }
+                }
             }
         }
         terminal.draw(|f| ui(f, app))?;
@@ -954,8 +1045,16 @@ async fn event_loop<B: Backend + io::Write>(
                     KeyOutcome::None => {}
                     KeyOutcome::Switch(i) => switch_account(i, accounts_ctx, app, epoch, handle, tx),
                     KeyOutcome::AddAccount(provider) => {
-                        add_account_flow(terminal, accounts_ctx, app, epoch, handle, tx, provider)
-                            .await?;
+                        if provider_configured(provider) {
+                            app.modal = Some(Modal::working(provider));
+                            start_auth(provider, tx);
+                        } else {
+                            app.modal = Some(Modal::credential(provider, true));
+                        }
+                    }
+                    KeyOutcome::StartAuth(provider) => {
+                        app.modal = Some(Modal::working(provider));
+                        start_auth(provider, tx);
                     }
                 }
             }
@@ -964,33 +1063,59 @@ async fn event_loop<B: Backend + io::Write>(
     Ok(())
 }
 
-/// Suspend the TUI, run the browser OAuth flow, then resume and switch to the
-/// newly-added account.
-#[allow(clippy::too_many_arguments)]
-async fn add_account_flow<B: Backend + io::Write>(
-    terminal: &mut Terminal<B>,
+fn provider_configured(provider: accounts::Provider) -> bool {
+    match provider {
+        accounts::Provider::Gmail => config::gmail_configured(),
+        accounts::Provider::Outlook => config::outlook_configured(),
+    }
+}
+
+/// Spawn the background sign-in task; prompts/result flow back over the channel.
+fn start_auth(provider: accounts::Provider, tx: &UnboundedSender<(u64, ScanEvent)>) {
+    let prompt_tx = tx.clone();
+    let on_prompt: accounts::PromptFn = Arc::new(move |p: AuthPrompt| {
+        let lines = match p {
+            AuthPrompt::Browser { url } => vec![
+                "Opening your browser to sign in.".to_string(),
+                "If it didn't open, visit:".to_string(),
+                url,
+            ],
+            AuthPrompt::DeviceCode {
+                verification_uri,
+                user_code,
+                ..
+            } => vec![
+                "In any browser, open:".to_string(),
+                verification_uri,
+                String::new(),
+                format!("and enter code:  {user_code}"),
+            ],
+        };
+        let _ = prompt_tx.send((0, ScanEvent::AuthPrompt(lines)));
+    });
+    let done_tx = tx.clone();
+    tokio::spawn(async move {
+        let res = accounts::add_account(provider, on_prompt)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = done_tx.send((0, ScanEvent::AuthDone(provider, res)));
+    });
+}
+
+fn handle_auth_done(
+    provider: accounts::Provider,
+    res: Result<String, String>,
     accounts_ctx: &mut Vec<AccountCtx>,
     app: &mut App,
     epoch: &mut u64,
     handle: &mut JoinHandle<()>,
     tx: &UnboundedSender<(u64, ScanEvent)>,
-    provider: accounts::Provider,
-) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    println!("\nStarting sign-in for a new {} account…", provider.label());
-
-    let result = accounts::add_account(provider).await;
-
-    enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-    terminal.clear()?;
-
-    match result {
+) {
+    match res {
         Ok(email) => {
             if let Some(i) = accounts_ctx.iter().position(|c| c.email == email) {
                 switch_account(i, accounts_ctx, app, epoch, handle, tx);
-                app.status = format!("Account {email} already added");
+                app.modal = Some(Modal::message(format!("{email} is already added")));
             } else {
                 let account = accounts::Account {
                     email: email.clone(),
@@ -1001,15 +1126,85 @@ async fn add_account_flow<B: Backend + io::Write>(
                         accounts_ctx.push(ctx);
                         app.accounts.push(email.clone());
                         switch_account(accounts_ctx.len() - 1, accounts_ctx, app, epoch, handle, tx);
-                        app.status = format!("Added {email}");
+                        app.modal = Some(Modal::message(format!("Added {email}")));
                     }
-                    Err(e) => app.status = format!("Add account failed: {e}"),
+                    Err(e) => app.modal = Some(Modal::message(format!("Failed: {e}"))),
                 }
             }
         }
-        Err(e) => app.status = format!("Add account failed: {e}"),
+        Err(e) => app.modal = Some(Modal::message(format!("Sign-in failed: {e}"))),
     }
-    Ok(())
+}
+
+fn save_cred(provider: accounts::Provider, input: &str) -> Result<()> {
+    match provider {
+        accounts::Provider::Gmail => config::save_gmail_secret(input),
+        accounts::Provider::Outlook => config::save_ms_client_id(input),
+    }
+}
+
+/// Handle a keypress while the add-account modal is open.
+fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
+    enum Act {
+        None,
+        Close,
+        Message(String),
+        StartAuth(accounts::Provider),
+    }
+
+    let act = {
+        let Some(modal) = app.modal.as_mut() else {
+            return KeyOutcome::None;
+        };
+        match &mut modal.state {
+            ModalState::Credential {
+                provider,
+                input,
+                error,
+                then_auth,
+            } => match code {
+                KeyCode::Esc => Act::Close,
+                KeyCode::Enter => match save_cred(*provider, input) {
+                    Ok(()) if *then_auth => Act::StartAuth(*provider),
+                    Ok(()) => Act::Message(format!("Saved {} credential", provider.label())),
+                    Err(e) => {
+                        *error = Some(e.to_string());
+                        Act::None
+                    }
+                },
+                KeyCode::Backspace => {
+                    input.pop();
+                    Act::None
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    Act::None
+                }
+                _ => Act::None,
+            },
+            ModalState::Working { .. } => match code {
+                KeyCode::Esc => Act::Close,
+                _ => Act::None,
+            },
+            ModalState::Message(_) => match code {
+                KeyCode::Enter | KeyCode::Esc => Act::Close,
+                _ => Act::None,
+            },
+        }
+    };
+
+    match act {
+        Act::None => KeyOutcome::None,
+        Act::Close => {
+            app.modal = None;
+            KeyOutcome::None
+        }
+        Act::Message(m) => {
+            app.modal = Some(Modal::message(m));
+            KeyOutcome::None
+        }
+        Act::StartAuth(p) => KeyOutcome::StartAuth(p),
+    }
 }
 
 async fn handle_key(
@@ -1018,11 +1213,29 @@ async fn handle_key(
     em: &Emitter,
     code: KeyCode,
 ) -> KeyOutcome {
+    if app.modal.is_some() {
+        return modal_key(app, code);
+    }
+    // Config panel: set provider credentials.
+    if app.focus == Panel::Config {
+        match code {
+            KeyCode::Char('g') => {
+                app.modal = Some(Modal::credential(accounts::Provider::Gmail, false));
+                return KeyOutcome::None;
+            }
+            KeyCode::Char('o') => {
+                app.modal = Some(Modal::credential(accounts::Provider::Outlook, false));
+                return KeyOutcome::None;
+            }
+            _ => {}
+        }
+    }
     match code {
         KeyCode::Char('q') | KeyCode::Esc => return KeyOutcome::Quit,
         KeyCode::Char('1') => app.focus = Panel::Accounts,
-        KeyCode::Char('2') => app.focus = Panel::Domains,
-        KeyCode::Char('3') => app.focus = Panel::Details,
+        KeyCode::Char('2') => app.focus = Panel::Config,
+        KeyCode::Char('3') => app.focus = Panel::Domains,
+        KeyCode::Char('4') => app.focus = Panel::Details,
         KeyCode::Tab => app.set_view(app.view.next()),
         KeyCode::BackTab => app.set_view(app.view.prev()),
         KeyCode::Char('l') | KeyCode::Right => app.expand(),
@@ -1191,7 +1404,10 @@ fn ui(f: &mut Frame, app: &App) {
     ])
     .split(f.area());
 
-    render_accounts(f, app, rows[0]);
+    let top = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(rows[0]);
+    render_accounts(f, app, top[0]);
+    render_config(f, app, top[1]);
 
     let body = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(rows[1]);
@@ -1199,6 +1415,124 @@ fn ui(f: &mut Frame, app: &App) {
     render_details(f, app, body[1]);
 
     f.render_widget(Paragraph::new(app.status.clone()), rows[2]);
+
+    if let Some(modal) = &app.modal {
+        render_modal(f, modal);
+    }
+}
+
+fn render_config(f: &mut Frame, app: &App, area: Rect) {
+    let mark = |ok: bool| if ok { "✓" } else { "✗" };
+    let lines = vec![
+        Line::from(format!("Gmail client secret  {}", mark(config::gmail_configured()))),
+        Line::from(format!("Outlook app id       {}", mark(config::outlook_configured()))),
+        Line::from(""),
+        Line::from(Span::styled(
+            "g set Gmail · o set Outlook",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).block(panel_block(app, Panel::Config, "[2] Config")),
+        area,
+    );
+}
+
+/// A centered rectangle `px`%×`py`% of `r`.
+fn centered_rect(px: u16, py: u16, r: Rect) -> Rect {
+    let vert = Layout::vertical([
+        Constraint::Percentage((100 - py) / 2),
+        Constraint::Percentage(py),
+        Constraint::Percentage((100 - py) / 2),
+    ])
+    .split(r);
+    Layout::horizontal([
+        Constraint::Percentage((100 - px) / 2),
+        Constraint::Percentage(px),
+        Constraint::Percentage((100 - px) / 2),
+    ])
+    .split(vert[1])[1]
+}
+
+fn render_modal(f: &mut Frame, modal: &Modal) {
+    let area = centered_rect(64, 50, f.area());
+    f.render_widget(Clear, area);
+
+    let (title, lines): (&str, Vec<Line>) = match &modal.state {
+        ModalState::Credential {
+            provider,
+            input,
+            error,
+            ..
+        } => {
+            let hint = match provider {
+                accounts::Provider::Gmail => {
+                    "Paste your client_secret.json contents, or a path to the file:"
+                }
+                accounts::Provider::Outlook => {
+                    "Paste your Azure app (client) id, or a path to a file with it:"
+                }
+            };
+            let mut lines = vec![
+                Line::from(format!("Set {} credential", provider.label())),
+                Line::from(""),
+                Line::from(hint),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("> {input}"),
+                    Style::default().fg(Color::Cyan),
+                )),
+            ];
+            if let Some(e) = error {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    e.clone(),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Enter to save · Esc to cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            ("Add account", lines)
+        }
+        ModalState::Working { provider, lines } => {
+            let mut out = vec![
+                Line::from(format!("Signing in to {}…", provider.label())),
+                Line::from(""),
+            ];
+            for l in lines {
+                out.push(Line::from(l.clone()));
+            }
+            out.push(Line::from(""));
+            out.push(Line::from(Span::styled(
+                "Esc to cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            ("Sign in", out)
+        }
+        ModalState::Message(m) => (
+            "Account",
+            vec![
+                Line::from(m.clone()),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter to close",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ],
+        ),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(title);
+    f.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn panel_block(app: &App, panel: Panel, title: impl Into<String>) -> Block<'static> {
@@ -1293,7 +1627,7 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
         format!(" · {} marked", app.marked.len())
     };
     let title = format!(
-        "[2] Domains ({}{}) · sort {}",
+        "[3] Domains ({}{}) · sort {}",
         app.groups.len(),
         marked,
         app.sort.label()
@@ -1405,7 +1739,7 @@ fn row_line(app: &App, row: &Row) -> Line<'static> {
 
 fn render_details(f: &mut Frame, app: &App, area: Rect) {
     let widget = Paragraph::new(detail_lines(app))
-        .block(panel_block(app, Panel::Details, "[3] Details"))
+        .block(panel_block(app, Panel::Details, "[4] Details"))
         .wrap(Wrap { trim: true })
         .scroll((app.detail_scroll, 0));
     f.render_widget(widget, area);

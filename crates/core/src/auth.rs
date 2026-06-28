@@ -13,6 +13,19 @@ use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 /// Access tokens are valid for ~1h; refresh a little early.
 const TOKEN_TTL: Duration = Duration::from_secs(50 * 60);
 
+/// A sign-in prompt surfaced to the UI during an interactive add-account flow.
+#[derive(Debug, Clone)]
+pub enum AuthPrompt {
+    /// Gmail: a browser was opened to this consent URL.
+    Browser { url: String },
+    /// Outlook: enter `user_code` at `verification_uri`.
+    DeviceCode {
+        verification_uri: String,
+        user_code: String,
+        message: String,
+    },
+}
+
 pub struct GmailAuth {
     secret_path: PathBuf,
     cache_path: PathBuf,

@@ -20,11 +20,19 @@ crates/
 ## Multiple accounts & providers
 
 Mailsweep supports **Gmail** and **Outlook/Hotmail** (consumer Microsoft
-accounts, via Microsoft Graph). Each account gets its own token cache, metadata
-cache, and sync checkpoint under `~/.config/mailsweep/accounts/<email>/`. Focus
+accounts, via Microsoft Graph). Configuration (your OAuth client credentials)
+lives in `~/.config/mailsweep/`; per-account data (tokens, metadata caches) and
+archives live in `~/.local/share/mailsweep/`.
+
+Everything is set up **in the app** — no manual file placement required. Focus
 the Accounts panel (`1`), move with `j`/`k`, and press `Enter` on an account to
-switch, or on `[+ Add Gmail account]` / `[+ Add Outlook account]` to authorize a
-new one. An existing single-account Gmail setup is migrated automatically.
+switch, or on `[+ Add Gmail account]` / `[+ Add Outlook account]` to add one. A
+modal wizard walks you through it: if that provider's credential isn't set yet,
+it prompts for it (paste the value/JSON, or a path to the file), then runs
+sign-in — a browser for Gmail, or a device code shown in the modal for Outlook.
+The **Config panel** (`2`) shows credential status; press `g`/`o` there to set
+the Gmail/Outlook credential directly. An existing single-account Gmail setup is
+migrated automatically.
 
 - **Gmail**: browser consent (see Google setup below). In "testing" mode, every
   Gmail account you add must be a **test user** in your Cloud project.
