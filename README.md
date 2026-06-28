@@ -17,17 +17,27 @@ crates/
   gui/    iced desktop frontend       (binary: mailsweep-gui)
 ```
 
-## Multiple accounts
+## Multiple accounts & providers
 
-Each account gets its own token cache, metadata cache, and `historyId`, all
-under `~/.config/mailsweep/accounts/<email>/`, and all share the one OAuth client
-you set up below. Focus the Accounts panel (`1`), move with `j`/`k`, and press
-`Enter` on `[+ Add account]` to authorize another Gmail account in your browser;
-`Enter` on an account switches to it. An existing single-account setup is
-migrated automatically on first launch.
+Mailsweep supports **Gmail** and **Outlook/Hotmail** (consumer Microsoft
+accounts, via Microsoft Graph). Each account gets its own token cache, metadata
+cache, and sync checkpoint under `~/.config/mailsweep/accounts/<email>/`. Focus
+the Accounts panel (`1`), move with `j`/`k`, and press `Enter` on an account to
+switch, or on `[+ Add Gmail account]` / `[+ Add Outlook account]` to authorize a
+new one. An existing single-account Gmail setup is migrated automatically.
 
-Note: while your OAuth client is in "testing" mode, every Gmail account you add
-must be listed as a **test user** in your Cloud project (see below).
+- **Gmail**: browser consent (see Google setup below). In "testing" mode, every
+  Gmail account you add must be a **test user** in your Cloud project.
+- **Outlook**: device-code sign-in — the app prints a URL and code to enter in
+  any browser. Requires your own Azure "public client" app id in
+  `MAILSWEEP_MS_CLIENT_ID` (or `~/.config/mailsweep/ms_client_id`), with the
+  `Mail.ReadWrite`, `User.Read`, and `offline_access` delegated permissions and
+  "Allow public client flows" enabled.
+
+Provider differences: Outlook doesn't expose a per-message size, so the Size
+sort/column shows attachment sizes only (message sizes read as 0); everything
+else (tree, tabs, marks, archive, unsubscribe, incremental delta sync) works the
+same.
 
 ## One-time Google setup
 

@@ -13,7 +13,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -29,6 +29,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
+use mailsweep_core::outlook::{MsAuth, OutlookClient};
 use mailsweep_core::{
     accounts, archive_attachments, config, group_messages, ArchiveItem, AttachmentInfo, Cache,
     DomainGroup, FetchProgress, GmailAuth, GmailClient, MailProvider, MessageMeta, Profile,
@@ -78,7 +79,7 @@ enum KeyOutcome {
     None,
     Quit,
     Switch(usize),
-    AddAccount,
+    AddAccount(accounts::Provider),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -254,14 +255,19 @@ impl App {
         self.status = HELP.to_string();
     }
 
-    /// Activated Enter in the Accounts panel: switch or add.
+    /// Activated Enter in the Accounts panel: switch or add (Gmail/Outlook).
     fn account_enter(&self) -> KeyOutcome {
-        if self.account_cursor >= self.accounts.len() {
-            KeyOutcome::AddAccount
-        } else if self.account_cursor == self.active {
-            KeyOutcome::None
+        let n = self.accounts.len();
+        if self.account_cursor < n {
+            if self.account_cursor == self.active {
+                KeyOutcome::None
+            } else {
+                KeyOutcome::Switch(self.account_cursor)
+            }
+        } else if self.account_cursor == n {
+            KeyOutcome::AddAccount(accounts::Provider::Gmail)
         } else {
-            KeyOutcome::Switch(self.account_cursor)
+            KeyOutcome::AddAccount(accounts::Provider::Outlook)
         }
     }
 
@@ -422,8 +428,8 @@ impl App {
         match self.focus {
             Panel::Details => self.detail_scroll = self.detail_scroll.saturating_add(1),
             Panel::Accounts => {
-                // Range 0..=accounts.len(); the last row is "+ Add account".
-                if self.account_cursor < self.accounts.len() {
+                // Rows: accounts, then "+ Add Gmail" and "+ Add Outlook".
+                if self.account_cursor < self.accounts.len() + 1 {
                     self.account_cursor += 1;
                 }
             }
@@ -669,14 +675,17 @@ impl App {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = accounts::migrate_legacy_if_needed().await;
-    let mut emails = accounts::list_accounts();
-    if emails.is_empty() {
-        println!("No accounts configured. Opening your browser to authorize the first account…");
-        let email = accounts::add_account().await?;
+    let mut list = accounts::list_accounts();
+    if list.is_empty() {
+        println!("No accounts configured. Authorizing your first (Gmail) account…");
+        let email = accounts::add_account(accounts::Provider::Gmail).await?;
         println!("Authorized {email}.");
-        emails = vec![email];
+        list = vec![accounts::Account {
+            email,
+            provider: accounts::Provider::Gmail,
+        }];
     }
-    run_app(emails).await
+    run_app(list).await
 }
 
 /// A configured account and its live provider + cache.
@@ -686,13 +695,25 @@ struct AccountCtx {
     cache: Cache,
 }
 
-fn build_account(email: &str) -> Result<AccountCtx> {
-    let auth = GmailAuth::new(config::secret_path(), accounts::token_path(email), config::SCOPES);
-    let cache = Cache::open(accounts::cache_path(email))?;
-    let client = GmailClient::new(Arc::new(auth)).with_cache(cache.clone());
+fn build_account(account: &accounts::Account) -> Result<AccountCtx> {
+    let email = account.email.clone();
+    let cache = Cache::open(accounts::cache_path(&email))?;
+    let provider: Arc<dyn MailProvider> = match account.provider {
+        accounts::Provider::Gmail => {
+            let auth =
+                GmailAuth::new(config::secret_path(), accounts::token_path(&email), config::SCOPES);
+            Arc::new(GmailClient::new(Arc::new(auth)).with_cache(cache.clone()))
+        }
+        accounts::Provider::Outlook => {
+            let client_id = config::ms_client_id()
+                .context("set MAILSWEEP_MS_CLIENT_ID to your Azure app id for Outlook")?;
+            let auth = MsAuth::new(client_id, accounts::token_path(&email));
+            Arc::new(OutlookClient::new(Arc::new(auth)).with_cache(cache.clone()))
+        }
+    };
     Ok(AccountCtx {
-        email: email.to_string(),
-        provider: Arc::new(client),
+        email,
+        provider,
         cache,
     })
 }
@@ -707,12 +728,12 @@ fn spawn_scan(epoch: u64, ctx: &AccountCtx, tx: &UnboundedSender<(u64, ScanEvent
     tokio::spawn(async move { run_scan(em, provider, cache).await })
 }
 
-async fn run_app(emails: Vec<String>) -> Result<()> {
+async fn run_app(list: Vec<accounts::Account>) -> Result<()> {
     let mut accounts_ctx: Vec<AccountCtx> = Vec::new();
-    for email in &emails {
-        match build_account(email) {
+    for acct in &list {
+        match build_account(acct) {
             Ok(ctx) => accounts_ctx.push(ctx),
-            Err(e) => eprintln!("Skipping account {email}: {e}"),
+            Err(e) => eprintln!("Skipping account {}: {e}", acct.email),
         }
     }
     if accounts_ctx.is_empty() {
@@ -931,8 +952,9 @@ async fn event_loop<B: Backend + io::Write>(
                     KeyOutcome::Quit => break,
                     KeyOutcome::None => {}
                     KeyOutcome::Switch(i) => switch_account(i, accounts_ctx, app, epoch, handle, tx),
-                    KeyOutcome::AddAccount => {
-                        add_account_flow(terminal, accounts_ctx, app, epoch, handle, tx).await?;
+                    KeyOutcome::AddAccount(provider) => {
+                        add_account_flow(terminal, accounts_ctx, app, epoch, handle, tx, provider)
+                            .await?;
                     }
                 }
             }
@@ -943,6 +965,7 @@ async fn event_loop<B: Backend + io::Write>(
 
 /// Suspend the TUI, run the browser OAuth flow, then resume and switch to the
 /// newly-added account.
+#[allow(clippy::too_many_arguments)]
 async fn add_account_flow<B: Backend + io::Write>(
     terminal: &mut Terminal<B>,
     accounts_ctx: &mut Vec<AccountCtx>,
@@ -950,12 +973,13 @@ async fn add_account_flow<B: Backend + io::Write>(
     epoch: &mut u64,
     handle: &mut JoinHandle<()>,
     tx: &UnboundedSender<(u64, ScanEvent)>,
+    provider: accounts::Provider,
 ) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    println!("\nOpening your browser to authorize a new account…");
+    println!("\nStarting sign-in for a new {} account…", provider.label());
 
-    let result = accounts::add_account().await;
+    let result = accounts::add_account(provider).await;
 
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
@@ -967,7 +991,11 @@ async fn add_account_flow<B: Backend + io::Write>(
                 switch_account(i, accounts_ctx, app, epoch, handle, tx);
                 app.status = format!("Account {email} already added");
             } else {
-                match build_account(&email) {
+                let account = accounts::Account {
+                    email: email.clone(),
+                    provider,
+                };
+                match build_account(&account) {
                     Ok(ctx) => {
                         accounts_ctx.push(ctx);
                         app.accounts.push(email.clone());
@@ -1153,8 +1181,8 @@ async fn unsubscribe(app: &App, provider: &dyn MailProvider) -> String {
 // ---- rendering --------------------------------------------------------------
 
 fn ui(f: &mut Frame, app: &App) {
-    // Accounts panel: borders (2) + one row per account + add row + sync line.
-    let accounts_height = (app.accounts.len() as u16 + 4).clamp(5, 12);
+    // Accounts panel: borders (2) + account rows + 2 add rows + sync line.
+    let accounts_height = (app.accounts.len() as u16 + 5).clamp(6, 14);
     let rows = Layout::vertical([
         Constraint::Length(accounts_height),
         Constraint::Min(3),
@@ -1215,7 +1243,11 @@ fn render_accounts(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     items.push(ListItem::new(Line::from(Span::styled(
-        "[+ Add account]",
+        "[+ Add Gmail account]",
+        Style::default().fg(Color::Green),
+    ))));
+    items.push(ListItem::new(Line::from(Span::styled(
+        "[+ Add Outlook account]",
         Style::default().fg(Color::Green),
     ))));
 

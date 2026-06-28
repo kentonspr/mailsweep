@@ -48,6 +48,24 @@ pub fn accounts_dir() -> PathBuf {
     config_dir().join("accounts")
 }
 
+/// Microsoft Graph delegated scopes (personal accounts; device-code flow).
+pub const MS_SCOPE: &str = "offline_access User.Read Mail.ReadWrite";
+
+/// The user's Azure app (public client) ID for Outlook sign-in.
+///
+/// From `MAILSWEEP_MS_CLIENT_ID`, or `~/.config/mailsweep/ms_client_id`.
+pub fn ms_client_id() -> Option<String> {
+    if let Ok(v) = std::env::var("MAILSWEEP_MS_CLIENT_ID") {
+        if !v.trim().is_empty() {
+            return Some(v.trim().to_string());
+        }
+    }
+    std::fs::read_to_string(config_dir().join("ms_client_id"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Maximum number of messages to scan.
 ///
 /// Defaults to no limit (the whole inbox). Override with the

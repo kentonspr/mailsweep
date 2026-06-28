@@ -8,6 +8,7 @@ pub mod cache;
 pub mod config;
 pub mod gmail;
 pub mod model;
+pub mod outlook;
 pub mod provider;
 pub mod unsubscribe;
 
