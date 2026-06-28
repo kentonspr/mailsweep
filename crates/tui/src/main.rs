@@ -674,6 +674,7 @@ impl App {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    config::migrate_to_data_dir();
     let _ = accounts::migrate_legacy_if_needed().await;
     let mut list = accounts::list_accounts();
     if list.is_empty() {
