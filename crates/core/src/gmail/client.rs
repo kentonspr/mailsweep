@@ -20,7 +20,7 @@ use tokio::time::sleep;
 use crate::auth::GmailAuth;
 use crate::cache::Cache;
 use crate::model::MessageMeta;
-use crate::provider::MailProvider;
+use crate::provider::{MailProvider, ProgressCallback, SyncResult};
 use crate::unsubscribe::UnsubscribeInfo;
 
 const BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -478,12 +478,45 @@ fn collect_attachments(part: &FullPart, out: &mut Vec<AttachmentInfo>) {
 
 #[async_trait]
 impl MailProvider for GmailClient {
-    async fn list_message_ids(&self, query: Option<&str>, max: usize) -> Result<Vec<String>> {
-        GmailClient::list_message_ids(self, query, max).await
+    async fn profile(&self) -> Result<Profile> {
+        GmailClient::profile(self).await
     }
 
-    async fn fetch_metadata(&self, ids: &[String]) -> Result<Vec<MessageMeta>> {
-        GmailClient::fetch_metadata(self, ids).await
+    async fn inbox_sync(&self, token: Option<&str>, max: usize) -> Result<SyncResult> {
+        // Capture the checkpoint before reading, so changes during the sync are
+        // picked up next time rather than missed.
+        let next_token = GmailClient::profile(self).await?.history_id;
+        if let Some(start) = token {
+            if let Some(delta) = self.history_since(start).await? {
+                return Ok(SyncResult {
+                    added: delta.added,
+                    removed: delta.removed,
+                    next_token,
+                    full: false,
+                });
+            }
+        }
+        let ids = self.list_message_ids(Some("in:inbox"), max).await?;
+        Ok(SyncResult {
+            added: ids,
+            removed: Vec::new(),
+            next_token,
+            full: true,
+        })
+    }
+
+    async fn list_attachment_ids(&self, max: usize) -> Result<Vec<String>> {
+        self.list_message_ids(Some("in:inbox has:attachment"), max)
+            .await
+    }
+
+    async fn fetch_metadata(
+        &self,
+        ids: &[String],
+        on_update: ProgressCallback<'_>,
+    ) -> Result<FetchReport> {
+        self.fetch_metadata_with(ids, |p, batch| on_update(p, batch))
+            .await
     }
 
     async fn trash(&self, ids: &[String]) -> Result<()> {
@@ -493,6 +526,22 @@ impl MailProvider for GmailClient {
 
     async fn mark_spam(&self, ids: &[String]) -> Result<()> {
         self.batch_modify(ids, &["SPAM"], &["INBOX"]).await
+    }
+
+    async fn unsubscribe_one_click(&self, info: &UnsubscribeInfo) -> Result<bool> {
+        GmailClient::unsubscribe_one_click(self, info).await
+    }
+
+    async fn message_attachments(&self, id: &str) -> Result<Vec<AttachmentInfo>> {
+        GmailClient::message_attachments(self, id).await
+    }
+
+    async fn download_attachment(
+        &self,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<Vec<u8>> {
+        GmailClient::download_attachment(self, message_id, attachment_id).await
     }
 }
 

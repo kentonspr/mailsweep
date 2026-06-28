@@ -16,7 +16,7 @@ use serde::Serialize;
 use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::CompressionMethod;
 
-use crate::gmail::GmailClient;
+use crate::provider::MailProvider;
 
 /// One message whose attachments should be archived.
 #[derive(Debug, Clone)]
@@ -59,7 +59,7 @@ struct ManifestAttachment {
 /// Messages without attachments are skipped; individual download failures are
 /// skipped rather than aborting the whole archive.
 pub async fn archive_attachments(
-    client: &GmailClient,
+    provider: &dyn MailProvider,
     items: &[ArchiveItem],
     out_path: &Path,
 ) -> Result<ArchiveSummary> {
@@ -78,7 +78,7 @@ pub async fn archive_attachments(
     let mut messages = 0;
 
     for item in items {
-        let attachments = client
+        let attachments = provider
             .message_attachments(&item.message_id)
             .await
             .unwrap_or_default();
@@ -89,7 +89,7 @@ pub async fn archive_attachments(
 
         let mut entry_attachments = Vec::new();
         for att in &attachments {
-            let data = match client
+            let data = match provider
                 .download_attachment(&item.message_id, &att.attachment_id)
                 .await
             {

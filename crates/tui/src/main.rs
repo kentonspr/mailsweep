@@ -32,7 +32,7 @@ use tokio::time::sleep;
 use mailsweep_core::{
     accounts, archive_attachments, config, group_messages, ArchiveItem, AttachmentInfo, Cache,
     DomainGroup, FetchProgress, GmailAuth, GmailClient, MailProvider, MessageMeta, Profile,
-    SenderEntry, UnsubscribeInfo,
+    SenderEntry, SyncResult, UnsubscribeInfo,
 };
 
 const HELP: &str = "Tab view · o sort · j/k move · h/l fold · Space mark · c clear · \
@@ -679,10 +679,10 @@ async fn main() -> Result<()> {
     run_app(emails).await
 }
 
-/// A configured account and its live client + cache.
+/// A configured account and its live provider + cache.
 struct AccountCtx {
     email: String,
-    client: GmailClient,
+    provider: Arc<dyn MailProvider>,
     cache: Cache,
 }
 
@@ -692,7 +692,7 @@ fn build_account(email: &str) -> Result<AccountCtx> {
     let client = GmailClient::new(Arc::new(auth)).with_cache(cache.clone());
     Ok(AccountCtx {
         email: email.to_string(),
-        client,
+        provider: Arc::new(client),
         cache,
     })
 }
@@ -702,9 +702,9 @@ fn spawn_scan(epoch: u64, ctx: &AccountCtx, tx: &UnboundedSender<(u64, ScanEvent
         tx: tx.clone(),
         epoch,
     };
-    let client = ctx.client.clone();
+    let provider = ctx.provider.clone();
     let cache = ctx.cache.clone();
-    tokio::spawn(async move { run_scan(em, client, cache).await })
+    tokio::spawn(async move { run_scan(em, provider, cache).await })
 }
 
 async fn run_app(emails: Vec<String>) -> Result<()> {
@@ -773,53 +773,43 @@ fn switch_account(
     *handle = spawn_scan(*epoch, &accounts_ctx[i], tx);
 }
 
-async fn run_scan(em: Emitter, client: GmailClient, cache: Cache) {
+async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache) {
     em.send(ScanEvent::Status("Authenticating…".to_string()));
-    let profile = match client.profile().await {
-        Ok(p) => {
-            em.send(ScanEvent::Account(p.clone()));
-            p
+    match provider.profile().await {
+        Ok(p) => em.send(ScanEvent::Account(p)),
+        Err(e) => {
+            em.send(ScanEvent::Failed(e.to_string()));
+            return;
         }
+    }
+
+    let limit = config::scan_limit();
+    let token = cache.get_state("history_id").await.ok().flatten();
+    em.send(ScanEvent::Status("Syncing inbox…".to_string()));
+    let result = match provider.inbox_sync(token.as_deref(), limit).await {
+        Ok(r) => r,
         Err(e) => {
             em.send(ScanEvent::Failed(e.to_string()));
             return;
         }
     };
 
-    // Metadata: incremental sync from the stored checkpoint if possible,
-    // otherwise a full inbox scan.
-    let mut did_incremental = false;
-    if let Ok(Some(start)) = cache.get_state("history_id").await {
-        match sync_incremental(&em, &client, &cache, &start).await {
-            Ok(true) => did_incremental = true,
-            Ok(false) => {} // history expired → full sync
-            Err(e) => em.send(ScanEvent::Status(format!(
-                "Incremental sync failed ({e}); doing full sync"
-            ))),
-        }
+    if result.full {
+        full_sync(&em, provider.as_ref(), &result.added).await;
+    } else {
+        incremental_sync(&em, provider.as_ref(), &cache, &result).await;
     }
-    if !did_incremental {
-        if let Err(e) = sync_full(&em, &client).await {
-            em.send(ScanEvent::Failed(e.to_string()));
-            return;
-        }
-    }
-    // Save the checkpoint captured at the start of this run.
-    let _ = cache.set_state("history_id", &profile.history_id).await;
+    let _ = cache.set_state("history_id", &result.next_token).await;
 
     // Attachments view data + background actual sizes (shared by both paths).
-    let limit = config::scan_limit();
-    let attachment_ids = client
-        .list_message_ids(Some("in:inbox has:attachment"), limit)
-        .await
-        .unwrap_or_default();
+    let attachment_ids = provider.list_attachment_ids(limit).await.unwrap_or_default();
     em.send(ScanEvent::AttachmentIds(
         attachment_ids.iter().cloned().collect(),
     ));
 
     let total = attachment_ids.len();
     for (i, id) in attachment_ids.into_iter().enumerate() {
-        if let Ok(list) = client.message_attachments(&id).await {
+        if let Ok(list) = provider.message_attachments(&id).await {
             em.send(ScanEvent::AttachmentDetails(id, list));
         }
         if i % 25 == 0 {
@@ -837,57 +827,44 @@ async fn run_scan(em: Emitter, client: GmailClient, cache: Cache) {
     }
 }
 
-/// Full inbox scan: list every message, fetch metadata (cache-aware).
-async fn sync_full(em: &Emitter, client: &GmailClient) -> Result<()> {
-    let limit = config::scan_limit();
-    em.send(ScanEvent::Status("Listing inbox…".to_string()));
-    let ids = client.list_message_ids(Some("in:inbox"), limit).await?;
+/// Full snapshot: fetch metadata for every inbox message (cache-aware).
+async fn full_sync(em: &Emitter, provider: &dyn MailProvider, ids: &[String]) {
     em.send(ScanEvent::Listed(ids.len()));
-
     let em2 = em.clone();
-    let report = client
-        .fetch_metadata_with(&ids, |p: FetchProgress, batch: &[MessageMeta]| {
-            em2.send(ScanEvent::Progress {
-                resolved: p.resolved,
-                total: p.total,
-                metas: batch.to_vec(),
-            });
-        })
-        .await?;
-
-    let resolved = report.from_cache + report.fetched;
-    let mut summary = format!("Synced · {resolved}/{} resolved", report.requested);
-    if !report.batch_errors.is_empty() {
-        summary.push_str(&format!(" · ⚠ {}", report.batch_errors[0]));
+    let mut on_update = move |p: FetchProgress, batch: &[MessageMeta]| {
+        em2.send(ScanEvent::Progress {
+            resolved: p.resolved,
+            total: p.total,
+            metas: batch.to_vec(),
+        });
+    };
+    match provider.fetch_metadata(ids, &mut on_update).await {
+        Ok(report) => {
+            let resolved = report.from_cache + report.fetched;
+            let mut summary = format!("Synced · {resolved}/{} resolved", report.requested);
+            if !report.batch_errors.is_empty() {
+                summary.push_str(&format!(" · ⚠ {}", report.batch_errors[0]));
+            }
+            em.send(ScanEvent::Done(summary));
+        }
+        Err(e) => em.send(ScanEvent::Failed(e.to_string())),
     }
-    em.send(ScanEvent::Done(summary));
-    Ok(())
 }
 
-/// Incremental sync: rebuild the current inbox from the cache plus the
-/// adds/removes since `start`. Returns `Ok(false)` if the history expired.
-async fn sync_incremental(
-    em: &Emitter,
-    client: &GmailClient,
-    cache: &Cache,
-    start: &str,
-) -> Result<bool> {
-    let delta = match client.history_since(start).await? {
-        Some(d) => d,
-        None => return Ok(false),
-    };
+/// Incremental: rebuild from the cache plus the sync deltas.
+async fn incremental_sync(em: &Emitter, provider: &dyn MailProvider, cache: &Cache, result: &SyncResult) {
     em.send(ScanEvent::Status("Incremental sync…".to_string()));
 
     let mut base = cache.all().await.unwrap_or_default();
-    let removed_n = delta.removed.len();
+    let removed_n = result.removed.len();
     if removed_n > 0 {
-        let _ = cache.remove(&delta.removed).await;
-        let rem: HashSet<&str> = delta.removed.iter().map(String::as_str).collect();
+        let _ = cache.remove(&result.removed).await;
+        let rem: HashSet<&str> = result.removed.iter().map(String::as_str).collect();
         base.retain(|m| !rem.contains(m.id.as_str()));
     }
 
     let have: HashSet<&str> = base.iter().map(|m| m.id.as_str()).collect();
-    let to_fetch: Vec<String> = delta
+    let to_fetch: Vec<String> = result
         .added
         .iter()
         .filter(|id| !have.contains(id.as_str()))
@@ -897,8 +874,6 @@ async fn sync_incremental(
 
     let base_n = base.len();
     let fetch_n = to_fetch.len();
-
-    // Show the cached set instantly, then stream in the new messages.
     em.send(ScanEvent::Progress {
         resolved: base_n,
         total: base_n + fetch_n,
@@ -907,21 +882,21 @@ async fn sync_incremental(
 
     if fetch_n > 0 {
         let em2 = em.clone();
-        client
-            .fetch_metadata_with(&to_fetch, |p: FetchProgress, batch: &[MessageMeta]| {
-                em2.send(ScanEvent::Progress {
-                    resolved: base_n + p.resolved,
-                    total: base_n + fetch_n,
-                    metas: batch.to_vec(),
-                });
-            })
-            .await?;
+        let mut on_update = move |p: FetchProgress, batch: &[MessageMeta]| {
+            em2.send(ScanEvent::Progress {
+                resolved: base_n + p.resolved,
+                total: base_n + fetch_n,
+                metas: batch.to_vec(),
+            });
+        };
+        if let Err(e) = provider.fetch_metadata(&to_fetch, &mut on_update).await {
+            em.send(ScanEvent::Status(format!("Fetch error: {e}")));
+        }
     }
 
     em.send(ScanEvent::Done(format!(
         "Incremental · {base_n} cached · {fetch_n} new · {removed_n} removed"
     )));
-    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -947,12 +922,12 @@ async fn event_loop<B: Backend + io::Write>(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                let client = accounts_ctx[app.active].client.clone();
+                let provider = accounts_ctx[app.active].provider.clone();
                 let em = Emitter {
                     tx: tx.clone(),
                     epoch: *epoch,
                 };
-                match handle_key(app, &client, &em, key.code).await {
+                match handle_key(app, &provider, &em, key.code).await {
                     KeyOutcome::Quit => break,
                     KeyOutcome::None => {}
                     KeyOutcome::Switch(i) => switch_account(i, accounts_ctx, app, epoch, handle, tx),
@@ -1010,7 +985,7 @@ async fn add_account_flow<B: Backend + io::Write>(
 
 async fn handle_key(
     app: &mut App,
-    client: &GmailClient,
+    provider: &Arc<dyn MailProvider>,
     em: &Emitter,
     code: KeyCode,
 ) -> KeyOutcome {
@@ -1039,25 +1014,25 @@ async fn handle_key(
             if app.focus == Panel::Accounts {
                 return app.account_enter();
             }
-            load_attachments(app, client).await;
+            load_attachments(app, provider.as_ref()).await;
         }
-        KeyCode::Char('a') => archive(app, client, em, false),
-        KeyCode::Char('A') => archive(app, client, em, true),
-        KeyCode::Char('d') => act(app, client, Action::Trash).await,
-        KeyCode::Char('s') => act(app, client, Action::Spam).await,
-        KeyCode::Char('u') => app.status = unsubscribe(app, client).await,
+        KeyCode::Char('a') => archive(app, provider, em, false),
+        KeyCode::Char('A') => archive(app, provider, em, true),
+        KeyCode::Char('d') => act(app, provider.as_ref(), Action::Trash).await,
+        KeyCode::Char('s') => act(app, provider.as_ref(), Action::Spam).await,
+        KeyCode::Char('u') => app.status = unsubscribe(app, provider.as_ref()).await,
         _ => {}
     }
     KeyOutcome::None
 }
 
-async fn load_attachments(app: &mut App, client: &GmailClient) {
+async fn load_attachments(app: &mut App, provider: &dyn MailProvider) {
     let Some(id) = app.selected_message_id() else { return };
     if app.attachments.contains_key(&id) {
         return;
     }
     app.status = "Loading attachments…".to_string();
-    match client.message_attachments(&id).await {
+    match provider.message_attachments(&id).await {
         Ok(list) => {
             app.attachments.insert(id, list);
             app.status = HELP.to_string();
@@ -1066,7 +1041,7 @@ async fn load_attachments(app: &mut App, client: &GmailClient) {
     }
 }
 
-fn archive(app: &mut App, client: &GmailClient, em: &Emitter, delete_after: bool) {
+fn archive(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, delete_after: bool) {
     let items = app.archive_items();
     if items.is_empty() {
         app.status = "No attachments to archive in selection".to_string();
@@ -1085,12 +1060,12 @@ fn archive(app: &mut App, client: &GmailClient, em: &Emitter, delete_after: bool
 
     let verb = if delete_after { "Archiving + deleting" } else { "Archiving" };
     app.status = format!("{verb} attachments from {} message(s)…", items.len());
-    let client = client.clone();
+    let provider = provider.clone();
     let em = em.clone();
     tokio::spawn(async move {
         let ids: Vec<String> = items.iter().map(|i| i.message_id.clone()).collect();
-        let msg = match archive_attachments(&client, &items, &path).await {
-            Ok(s) if delete_after => match client.trash(&ids).await {
+        let msg = match archive_attachments(provider.as_ref(), &items, &path).await {
+            Ok(s) if delete_after => match provider.trash(&ids).await {
                 Ok(()) => {
                     em.send(ScanEvent::Removed(ids.clone()));
                     format!(
@@ -1122,7 +1097,7 @@ enum Action {
     Spam,
 }
 
-async fn act(app: &mut App, client: &GmailClient, action: Action) {
+async fn act(app: &mut App, provider: &dyn MailProvider, action: Action) {
     let (ids, label) = app.action_ids();
     if ids.is_empty() {
         return;
@@ -1130,8 +1105,8 @@ async fn act(app: &mut App, client: &GmailClient, action: Action) {
     let n = ids.len();
 
     let result = match action {
-        Action::Trash => client.trash(&ids).await,
-        Action::Spam => client.mark_spam(&ids).await,
+        Action::Trash => provider.trash(&ids).await,
+        Action::Spam => provider.mark_spam(&ids).await,
     };
     let verb = match action {
         Action::Trash => "Trashed",
@@ -1147,7 +1122,7 @@ async fn act(app: &mut App, client: &GmailClient, action: Action) {
     };
 }
 
-async fn unsubscribe(app: &App, client: &GmailClient) -> String {
+async fn unsubscribe(app: &App, provider: &dyn MailProvider) -> String {
     let Some(target) = app.target() else {
         return "Nothing selected".to_string();
     };
@@ -1156,7 +1131,7 @@ async fn unsubscribe(app: &App, client: &GmailClient) -> String {
     };
 
     if info.one_click {
-        match client.unsubscribe_one_click(info).await {
+        match provider.unsubscribe_one_click(info).await {
             Ok(true) => return format!("Unsubscribed from {} (one-click)", target.label),
             Ok(false) => {}
             Err(e) => return format!("One-click unsubscribe failed: {e}"),
