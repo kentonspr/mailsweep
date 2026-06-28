@@ -12,8 +12,6 @@ use mailsweep_core::{
     config, group_by_domain, Cache, GmailAuth, GmailClient, MailProvider, SenderGroup,
 };
 
-const SCAN_LIMIT: usize = 1000;
-
 pub fn main() -> iced::Result {
     iced::application("Mailsweep", App::update, App::view).run_with(App::new)
 }
@@ -145,7 +143,7 @@ impl App {
 
 async fn scan(client: GmailClient) -> Result<Vec<SenderGroup>, String> {
     let ids = client
-        .list_message_ids(Some("in:inbox"), SCAN_LIMIT)
+        .list_message_ids(Some("in:inbox"), config::scan_limit())
         .await
         .map_err(|e| e.to_string())?;
     let metas = client

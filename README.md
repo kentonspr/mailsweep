@@ -92,9 +92,9 @@ describing every archived message and attachment.
 
 ## Notes / next steps
 
-- The initial scan is still capped at `SCAN_LIMIT` (1000) messages. To clean a
-  large mailbox end-to-end, raise the cap (the cache makes repeated scans cheap)
-  and consider incremental/paged loading so the UI is usable before the full
-  scan completes.
+- The scan covers the **whole inbox** by default. Set `MAILSWEEP_SCAN_LIMIT=N`
+  to cap it at N messages (e.g. for a quick look at a huge mailbox). The cache
+  makes repeated scans cheap, and the UI populates incrementally as messages
+  arrive.
 - Multi-account and multi-provider support (Outlook via Microsoft Graph, Yahoo
   via IMAP) hang off the `MailProvider` trait in `core/src/provider.rs`.

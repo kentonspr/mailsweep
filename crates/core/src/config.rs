@@ -42,3 +42,15 @@ pub fn cache_path() -> PathBuf {
 pub fn archive_dir() -> PathBuf {
     config_dir().join("archives")
 }
+
+/// Maximum number of messages to scan.
+///
+/// Defaults to no limit (the whole inbox). Override with the
+/// `MAILSWEEP_SCAN_LIMIT` environment variable.
+pub fn scan_limit() -> usize {
+    std::env::var("MAILSWEEP_SCAN_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(usize::MAX)
+}
