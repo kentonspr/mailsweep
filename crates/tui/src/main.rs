@@ -34,8 +34,8 @@ use mailsweep_core::{
 };
 
 const SCAN_LIMIT: usize = 1000;
-const HELP: &str = "1/2/3 focus · Tab view · j/k move · h/l collapse/expand · \
-    Enter attachments · a archive · d trash · s spam · u unsub · q quit";
+const HELP: &str = "Tab view · j/k move · h/l fold · Space mark · c clear · \
+    Enter attach · a archive · d trash · s spam · u unsub · q quit";
 
 /// Messages streamed from the background scan / archive tasks into the UI.
 enum ScanEvent {
@@ -65,10 +65,16 @@ enum View {
     All,
     Subscriptions,
     Attachments,
+    Large,
 }
 
 impl View {
-    const ALL: [View; 3] = [View::All, View::Subscriptions, View::Attachments];
+    const ALL: [View; 4] = [
+        View::All,
+        View::Subscriptions,
+        View::Attachments,
+        View::Large,
+    ];
 
     fn index(self) -> usize {
         View::ALL.iter().position(|v| *v == self).unwrap_or(0)
@@ -79,6 +85,7 @@ impl View {
             View::All => "All",
             View::Subscriptions => "Subscriptions",
             View::Attachments => "Attachments",
+            View::Large => "Large",
         }
     }
 
@@ -105,6 +112,13 @@ enum Node {
     Message,
 }
 
+/// Stable identity of a row, used to preserve the selection across regroups.
+enum SelKey {
+    Domain(String),
+    Sender(String),
+    Message(String),
+}
+
 /// What an action (trash/spam/unsubscribe) operates on.
 struct Target {
     ids: Vec<String>,
@@ -125,6 +139,8 @@ struct App {
     metas: Vec<MessageMeta>,
     attachment_ids: HashSet<String>,
     attachments: HashMap<String, Vec<AttachmentInfo>>,
+    /// Message IDs marked for a bulk action.
+    marked: HashSet<String>,
     view: View,
     groups: Vec<DomainGroup>,
     expanded_domains: HashSet<String>,
@@ -143,6 +159,7 @@ impl App {
             metas: Vec::new(),
             attachment_ids: HashSet::new(),
             attachments: HashMap::new(),
+            marked: HashSet::new(),
             view: View::All,
             groups: Vec::new(),
             expanded_domains: HashSet::new(),
@@ -208,7 +225,7 @@ impl App {
 
     fn filtered_metas(&self) -> Vec<MessageMeta> {
         match self.view {
-            View::All => self.metas.clone(),
+            View::All | View::Large => self.metas.clone(),
             View::Subscriptions => self
                 .metas
                 .iter()
@@ -225,8 +242,45 @@ impl App {
     }
 
     fn rebuild_groups(&mut self) {
+        // Preserve the selected node across regroups so it doesn't jump while
+        // the tree re-sorts during an incremental sync.
+        let anchor = self.selection_key();
         self.groups = group_messages(&self.filtered_metas());
-        self.clamp_selection();
+        if self.view == View::Large {
+            self.sort_by_size();
+        }
+        match anchor.and_then(|key| self.find_row(&key)) {
+            Some(pos) => self.selected = pos,
+            None => self.clamp_selection(),
+        }
+    }
+
+    /// Re-sort domains/senders/messages by total size (for the Large view).
+    fn sort_by_size(&mut self) {
+        for g in &mut self.groups {
+            for s in &mut g.senders {
+                s.messages.sort_by(|a, b| b.size_estimate.cmp(&a.size_estimate));
+            }
+            g.senders.sort_by(|a, b| b.size().cmp(&a.size()));
+        }
+        self.groups.sort_by(|a, b| b.size().cmp(&a.size()));
+    }
+
+    fn selection_key(&self) -> Option<SelKey> {
+        match self.rows().get(self.selected)? {
+            Row::Domain(g) => Some(SelKey::Domain(g.domain.clone())),
+            Row::Sender(_, s) => Some(SelKey::Sender(s.email.clone())),
+            Row::Message(_, _, m) => Some(SelKey::Message(m.id.clone())),
+        }
+    }
+
+    fn find_row(&self, key: &SelKey) -> Option<usize> {
+        self.rows().iter().position(|r| match (r, key) {
+            (Row::Domain(g), SelKey::Domain(d)) => g.domain == *d,
+            (Row::Sender(_, s), SelKey::Sender(e)) => s.email == *e,
+            (Row::Message(_, _, m), SelKey::Message(id)) => m.id == *id,
+            _ => false,
+        })
     }
 
     fn rows(&self) -> Vec<Row<'_>> {
@@ -379,7 +433,60 @@ impl App {
         }
     }
 
-    /// Collect archivable messages (those with attachments) under the selection.
+    /// All message IDs under the selected node.
+    fn selected_ids(&self) -> Vec<String> {
+        match self.rows().get(self.selected) {
+            Some(Row::Domain(g)) => g.message_ids(),
+            Some(Row::Sender(_, s)) => s.message_ids(),
+            Some(Row::Message(_, _, m)) => vec![m.id.clone()],
+            None => Vec::new(),
+        }
+    }
+
+    /// Toggle the mark on the selected node (marks/unmarks all its messages).
+    fn toggle_mark(&mut self) {
+        let ids = self.selected_ids();
+        if ids.is_empty() {
+            return;
+        }
+        if ids.iter().all(|id| self.marked.contains(id)) {
+            for id in &ids {
+                self.marked.remove(id);
+            }
+        } else {
+            self.marked.extend(ids);
+        }
+    }
+
+    /// Mark glyph for a set of IDs: all / some / none marked.
+    fn mark_glyph(&self, ids: &[String]) -> char {
+        let marked = ids.iter().filter(|id| self.marked.contains(*id)).count();
+        if marked == 0 {
+            ' '
+        } else if marked == ids.len() {
+            '●'
+        } else {
+            '◐'
+        }
+    }
+
+    /// IDs a bulk action targets: the marked set if any, else the selection.
+    fn action_ids(&self) -> (Vec<String>, String) {
+        if self.marked.is_empty() {
+            match self.target() {
+                Some(t) => (t.ids, t.label),
+                None => (Vec::new(), String::new()),
+            }
+        } else {
+            (
+                self.marked.iter().cloned().collect(),
+                format!("{} marked", self.marked.len()),
+            )
+        }
+    }
+
+    /// Collect archivable messages (those with attachments) for the marked set,
+    /// or — if nothing is marked — under the current selection.
     fn archive_items(&self) -> Vec<ArchiveItem> {
         let has_attachment = |m: &MessageMeta| self.attachment_ids.contains(&m.id);
         let item = |g: &DomainGroup, s: &SenderEntry, m: &MessageMeta| ArchiveItem {
@@ -389,6 +496,22 @@ impl App {
             subject: m.subject.clone(),
             date_ms: m.internal_date,
         };
+
+        if !self.marked.is_empty() {
+            return self
+                .metas
+                .iter()
+                .filter(|m| self.marked.contains(&m.id) && has_attachment(m))
+                .map(|m| ArchiveItem {
+                    message_id: m.id.clone(),
+                    domain: m.domain().to_string(),
+                    sender: m.from_email.clone(),
+                    subject: m.subject.clone(),
+                    date_ms: m.internal_date,
+                })
+                .collect();
+        }
+
         match self.rows().get(self.selected) {
             Some(Row::Domain(g)) => g
                 .senders
@@ -418,6 +541,7 @@ impl App {
         for id in ids {
             self.attachment_ids.remove(id);
             self.attachments.remove(id);
+            self.marked.remove(id);
         }
         self.rebuild_groups();
     }
@@ -555,6 +679,11 @@ async fn handle_key(
         KeyCode::Char('h') | KeyCode::Left => app.collapse(),
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::Char(' ') => app.toggle_mark(),
+        KeyCode::Char('c') => {
+            app.marked.clear();
+            app.status = "Cleared marks".to_string();
+        }
         KeyCode::Enter => load_attachments(app, client).await,
         KeyCode::Char('a') => archive(app, client, tx),
         KeyCode::Char('d') => act(app, client, Action::Trash).await,
@@ -622,12 +751,15 @@ enum Action {
 }
 
 async fn act(app: &mut App, client: &GmailClient, action: Action) {
-    let Some(target) = app.target() else { return };
-    let n = target.ids.len();
+    let (ids, label) = app.action_ids();
+    if ids.is_empty() {
+        return;
+    }
+    let n = ids.len();
 
     let result = match action {
-        Action::Trash => client.trash(&target.ids).await,
-        Action::Spam => client.mark_spam(&target.ids).await,
+        Action::Trash => client.trash(&ids).await,
+        Action::Spam => client.mark_spam(&ids).await,
     };
     let verb = match action {
         Action::Trash => "Trashed",
@@ -636,8 +768,8 @@ async fn act(app: &mut App, client: &GmailClient, action: Action) {
 
     app.status = match result {
         Ok(()) => {
-            app.remove_messages(&target.ids);
-            format!("{verb} {n} message(s) from {}", target.label)
+            app.remove_messages(&ids);
+            format!("{verb} {n} message(s) from {label}")
         }
         Err(e) => format!("Action failed: {e}"),
     };
@@ -747,7 +879,12 @@ fn tabs_line(active: View) -> Line<'static> {
 }
 
 fn render_domains(f: &mut Frame, app: &App, area: Rect) {
-    let block = panel_block(app, Panel::Domains, format!("2 Domains ({})", app.groups.len()));
+    let title = if app.marked.is_empty() {
+        format!("2 Domains ({})", app.groups.len())
+    } else {
+        format!("2 Domains ({} · {} marked)", app.groups.len(), app.marked.len())
+    };
+    let block = panel_block(app, Panel::Domains, title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -763,7 +900,7 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(tabs_line(app.view)), chunks[0]);
 
     let header = Line::from(Span::styled(
-        format!("{:3}{:>7} {:>8}  {}", "", "Senders", "Messages", "Name"),
+        format!("{:4}{:>7} {:>8}  {}", "", "Senders", "Messages", "Name"),
         Style::default().add_modifier(Modifier::UNDERLINED),
     ));
     f.render_widget(Paragraph::new(header), chunks[1]);
@@ -795,6 +932,7 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn row_line(app: &App, row: &Row) -> Line<'static> {
+    let large = app.view == View::Large;
     match row {
         Row::Domain(g) => {
             let marker = if app.expanded_domains.contains(&g.domain) {
@@ -802,9 +940,15 @@ fn row_line(app: &App, row: &Row) -> Line<'static> {
             } else {
                 '▸'
             };
+            let mark = app.mark_glyph(&g.message_ids());
             let unsub = if g.unsubscribe.is_some() { " ✉" } else { "" };
+            let size = if large {
+                format!("  ({})", human_bytes(g.size()))
+            } else {
+                String::new()
+            };
             Line::from(format!(
-                "{marker}  {:>7} {:>8}  {}{unsub}",
+                "{mark}{marker}  {:>7} {:>8}  {}{unsub}{size}",
                 g.sender_count(),
                 g.count(),
                 g.domain
@@ -816,23 +960,32 @@ fn row_line(app: &App, row: &Row) -> Line<'static> {
             } else {
                 '▸'
             };
+            let mark = app.mark_glyph(&s.message_ids());
             let unsub = if s.unsubscribe.is_some() { " ✉" } else { "" };
             let who = s.name.clone().unwrap_or_else(|| s.email.clone());
+            let size = if large {
+                format!("  ({})", human_bytes(s.size()))
+            } else {
+                String::new()
+            };
             Line::from(format!(
-                " {marker} {:>7} {:>8}    {who} <{}>{unsub}",
+                "{mark} {marker} {:>7} {:>8}    {who} <{}>{unsub}{size}",
                 "",
                 s.count(),
                 s.email
             ))
         }
-        Row::Message(_, _, m) => Line::from(format!(
-            "   {:>7} {:>8}      {}  {:>8}  {}",
-            "",
-            "",
-            fmt_date_short(m.internal_date),
-            human_bytes(m.size_estimate),
-            m.subject
-        )),
+        Row::Message(_, _, m) => {
+            let mark = app.mark_glyph(std::slice::from_ref(&m.id));
+            Line::from(format!(
+                "{mark}   {:>7} {:>8}    {}  {:>8}  {}",
+                "",
+                "",
+                fmt_date_short(m.internal_date),
+                human_bytes(m.size_estimate),
+                m.subject
+            ))
+        }
     }
 }
 

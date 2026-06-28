@@ -61,6 +61,10 @@ impl SenderEntry {
         self.messages.len()
     }
 
+    pub fn size(&self) -> u64 {
+        self.messages.iter().map(|m| m.size_estimate).sum()
+    }
+
     pub fn message_ids(&self) -> Vec<String> {
         self.messages.iter().map(|m| m.id.clone()).collect()
     }
@@ -77,6 +81,10 @@ pub struct DomainGroup {
 impl DomainGroup {
     pub fn count(&self) -> usize {
         self.senders.iter().map(SenderEntry::count).sum()
+    }
+
+    pub fn size(&self) -> u64 {
+        self.senders.iter().map(SenderEntry::size).sum()
     }
 
     pub fn sender_count(&self) -> usize {

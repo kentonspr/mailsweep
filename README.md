@@ -50,13 +50,19 @@ First launch opens a browser for consent; the token is cached to
 ### Keys (TUI)
 
 - `1`/`2`/`3` — focus the Accounts / Domains / Details panel
-- `Tab` / `Shift-Tab` — switch domain view (All / Subscriptions / Attachments)
+- `Tab` / `Shift-Tab` — switch domain view (All / Subscriptions / Attachments / Large)
 - `j`/`k` (or `↑`/`↓`) — move within the focused panel (or scroll Details)
 - `h`/`l` (or `←`/`→`) — collapse / expand the tree (domain → sender → message)
+- `Space` — mark/unmark the selected node; `c` — clear all marks
 - `Enter` — load the selected message's attachment list into Details
-- `a` — archive attachments of the selected domain / sender / message
-- `d` trash · `s` mark spam · `u` unsubscribe — acts on the selected node
+- `a` — archive attachments of the marked set (or the selected node)
+- `d` trash · `s` mark spam · `u` unsubscribe — acts on the marked set, or the selected node
 - `q` — quit
+
+Views: **All** (everything), **Subscriptions** (senders with an unsubscribe
+header), **Attachments** (`has:attachment`), **Large** (sorted by total size,
+with aggregate sizes shown per domain/sender). Marks (`●` full, `◐` partial)
+let you batch a trash/spam/archive across many domains/senders/messages at once.
 
 The inbox syncs in the background: the domain → sender → message tree fills in as
 messages arrive, with a progress bar until the scan completes.
