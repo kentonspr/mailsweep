@@ -61,6 +61,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("r", "Mark read"),
     ("u / U", "Unsubscribe / unsubscribe + delete"),
     ("z", "Undo last delete"),
+    ("O", "Overview / stats"),
     ("?", "Show this help"),
     ("q", "Quit"),
 ];
@@ -1677,6 +1678,9 @@ async fn handle_key(
             app.notify("Cleared all selections");
         }
         KeyCode::Char('?') => app.modal = Some(Modal::help()),
+        KeyCode::Char('O') => {
+            app.modal = Some(Modal::message_view("Overview".to_string(), overview_lines(app)));
+        }
         KeyCode::Enter => match app.focus {
             Panel::Accounts => return app.account_enter(),
             Panel::Config => return app.config_enter(),
@@ -2775,6 +2779,72 @@ fn apply_sort(groups: &mut [DomainGroup], sort: SortMode, size_of: &impl Fn(&Mes
         SortMode::Size => groups.sort_by(|a, b| domain_size(b).cmp(&domain_size(a))),
         SortMode::Recent => groups.sort_by(|a, b| domain_recent(b).cmp(&domain_recent(a))),
     }
+}
+
+/// Aggregate stats for the Overview modal, computed from the synced set.
+fn overview_lines(app: &App) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(p) = &app.account {
+        lines.push(format!("Account: {}", p.email));
+    }
+    if let Some(q) = &app.scope_query {
+        lines.push(format!("Scope:   {q}"));
+    }
+    lines.push(String::new());
+
+    let total_size: u64 = app.metas.iter().map(|m| m.size_estimate).sum();
+    let domains: HashSet<&str> = app.metas.iter().map(|m| m.domain()).collect();
+    let mut senders: HashMap<&str, (usize, u64)> = HashMap::new();
+    for m in &app.metas {
+        let e = senders.entry(m.from_email.as_str()).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += m.size_estimate;
+    }
+    let sub_msgs = app
+        .metas
+        .iter()
+        .filter(|m| m.list_unsubscribe.is_some())
+        .count();
+    let sub_senders: HashSet<&str> = app
+        .metas
+        .iter()
+        .filter(|m| m.list_unsubscribe.is_some())
+        .map(|m| m.from_email.as_str())
+        .collect();
+    let att_size: u64 = app.attachments.values().flatten().map(|a| a.size).sum();
+
+    lines.push(format!("Messages        {}", app.metas.len()));
+    lines.push(format!("Total size      {}", human_bytes(total_size)));
+    lines.push(format!("Domains         {}", domains.len()));
+    lines.push(format!("Senders         {}", senders.len()));
+    lines.push(format!(
+        "Subscriptions   {sub_msgs} messages from {} senders",
+        sub_senders.len()
+    ));
+    lines.push(format!(
+        "Attachments     {} messages · {} downloaded",
+        app.attachment_ids.len(),
+        human_bytes(att_size)
+    ));
+    lines.push(String::new());
+
+    let mut ranked: Vec<(&str, usize, u64)> =
+        senders.iter().map(|(e, (c, s))| (*e, *c, *s)).collect();
+
+    ranked.sort_by_key(|(_, c, _)| std::cmp::Reverse(*c));
+    lines.push("Top senders by message count:".to_string());
+    for (e, c, _) in ranked.iter().take(10) {
+        lines.push(format!("  {c:>6}  {e}"));
+    }
+    lines.push(String::new());
+
+    ranked.sort_by_key(|(_, _, s)| std::cmp::Reverse(*s));
+    lines.push("Top senders by total size:".to_string());
+    for (e, _, s) in ranked.iter().take(10) {
+        lines.push(format!("  {:>9}  {e}", human_bytes(*s)));
+    }
+
+    lines
 }
 
 fn human_bytes(n: u64) -> String {
