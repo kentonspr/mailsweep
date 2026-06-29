@@ -2162,8 +2162,10 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
     }
 }
 
-/// Keep domains/senders that fuzzy-match `query` (a domain match keeps all its
-/// senders; otherwise only matching senders are kept).
+/// Fuzzy-filter the tree by `query`, matching domains, senders, and subjects.
+///
+/// A domain-name match keeps the whole domain; a sender match keeps all of that
+/// sender's messages; otherwise only messages whose subject matches are kept.
 fn filter_by_search(groups: Vec<DomainGroup>, query: &str) -> Vec<DomainGroup> {
     let matcher = SkimMatcherV2::default();
     let hit = |hay: &str| matcher.fuzzy_match(hay, query).is_some();
@@ -2173,8 +2175,13 @@ fn filter_by_search(groups: Vec<DomainGroup>, query: &str) -> Vec<DomainGroup> {
             if hit(&g.domain) {
                 return Some(g);
             }
-            g.senders
-                .retain(|s| hit(&s.email) || s.name.as_deref().map_or(false, |n| hit(n)));
+            g.senders.retain_mut(|s| {
+                if hit(&s.email) || s.name.as_deref().map_or(false, |n| hit(n)) {
+                    return true;
+                }
+                s.messages.retain(|m| hit(&m.subject));
+                !s.messages.is_empty()
+            });
             if g.senders.is_empty() {
                 None
             } else {
