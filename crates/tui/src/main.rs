@@ -57,7 +57,9 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("c", "Clear all selections"),
     ("a / A", "Archive / archive + delete"),
     ("d / s", "Trash / spam"),
+    ("r", "Mark read"),
     ("u / U", "Unsubscribe / unsubscribe + delete"),
+    ("z", "Undo last delete"),
     ("?", "Show this help"),
     ("q", "Quit"),
 ];
@@ -128,6 +130,7 @@ enum KeyOutcome {
     Switch(usize),
     AddAccount(accounts::Provider),
     StartAuth(accounts::Provider),
+    ConfirmRun,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -167,6 +170,8 @@ enum ModalState {
     },
     /// Key reference.
     Help,
+    /// Yes/no confirmation for a destructive action.
+    Confirm(String),
 }
 
 impl Modal {
@@ -219,6 +224,12 @@ impl Modal {
     fn help() -> Self {
         Modal {
             state: ModalState::Help,
+        }
+    }
+
+    fn confirm(prompt: String) -> Self {
+        Modal {
+            state: ModalState::Confirm(prompt),
         }
     }
 }
@@ -353,8 +364,12 @@ struct App {
     pending_ops: usize,
     /// Advances each frame to animate the spinner.
     tick: u64,
-    /// Add-account wizard, when open.
+    /// Add-account wizard / confirm / message viewer, when open.
     modal: Option<Modal>,
+    /// A destructive op awaiting confirmation.
+    pending: Option<Pending>,
+    /// The most recent removal, for undo.
+    undo: Option<UndoBatch>,
     /// Throttles re-sorting while attachment sizes stream in.
     last_attach_sort: Instant,
     /// Background attachment-detail fetch progress.
@@ -395,6 +410,8 @@ impl App {
             pending_ops: 0,
             tick: 0,
             modal: None,
+            pending: None,
+            undo: None,
             last_attach_sort: Instant::now(),
             attach_active: false,
             attach_done: 0,
@@ -423,6 +440,8 @@ impl App {
         };
         self.history.clear();
         self.pending_ops = 0;
+        self.pending = None;
+        self.undo = None;
     }
 
     /// Append a message to the activity history.
@@ -914,6 +933,17 @@ impl App {
     /// Drop messages from the model (after trash/spam) and regroup.
     fn remove_messages(&mut self, ids: &[String]) {
         let set: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        // Capture the removed messages for a one-level undo.
+        let metas: Vec<MessageMeta> = self
+            .metas
+            .iter()
+            .filter(|m| set.contains(m.id.as_str()))
+            .cloned()
+            .collect();
+        if !metas.is_empty() {
+            let ids = metas.iter().map(|m| m.id.clone()).collect();
+            self.undo = Some(UndoBatch { ids, metas });
+        }
         self.metas.retain(|m| !set.contains(m.id.as_str()));
         for id in ids {
             self.attachment_ids.remove(id);
@@ -1259,6 +1289,17 @@ async fn event_loop<B: Backend + io::Write>(
                         app.modal = Some(Modal::working(provider));
                         start_auth(provider, tx);
                     }
+                    KeyOutcome::ConfirmRun => {
+                        app.modal = None;
+                        if let Some(pending) = app.pending.take() {
+                            let provider = accounts_ctx[app.active].provider.clone();
+                            let em = Emitter {
+                                tx: tx.clone(),
+                                epoch: *epoch,
+                            };
+                            run_pending(app, &provider, &em, pending);
+                        }
+                    }
                 }
             }
         }
@@ -1353,6 +1394,7 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
         Close,
         Message(String),
         StartAuth(accounts::Provider),
+        ConfirmRun,
     }
 
     let act = {
@@ -1409,6 +1451,11 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => Act::Close,
                 _ => Act::None,
             },
+            ModalState::Confirm(_) => match code {
+                KeyCode::Char('y') | KeyCode::Enter => Act::ConfirmRun,
+                KeyCode::Char('n') | KeyCode::Esc => Act::Close,
+                _ => Act::None,
+            },
         }
     };
 
@@ -1416,6 +1463,7 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
         Act::None => KeyOutcome::None,
         Act::Close => {
             app.modal = None;
+            app.pending = None;
             KeyOutcome::None
         }
         Act::Message(m) => {
@@ -1423,6 +1471,7 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
             KeyOutcome::None
         }
         Act::StartAuth(p) => KeyOutcome::StartAuth(p),
+        Act::ConfirmRun => KeyOutcome::ConfirmRun,
     }
 }
 
@@ -1505,6 +1554,8 @@ async fn handle_key(
         KeyCode::Char('A') => archive(app, provider, em, true),
         KeyCode::Char('d') => act(app, provider, em, Action::Trash),
         KeyCode::Char('s') => act(app, provider, em, Action::Spam),
+        KeyCode::Char('r') => act(app, provider, em, Action::Read),
+        KeyCode::Char('z') => undo_last(app, provider, em),
         KeyCode::Char('u') => unsubscribe(app, provider, em, false),
         KeyCode::Char('U') => unsubscribe(app, provider, em, true),
         _ => {}
@@ -1542,6 +1593,22 @@ fn archive(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, delete
         app.notify("Nothing to archive in selection");
         return;
     }
+    if delete_after && items.len() > CONFIRM_THRESHOLD {
+        let prompt = format!("Archive and delete {} message(s)?", items.len());
+        app.pending = Some(Pending::Archive(items, true));
+        app.modal = Some(Modal::confirm(prompt));
+    } else {
+        run_archive(app, provider, em, items, delete_after);
+    }
+}
+
+fn run_archive(
+    app: &mut App,
+    provider: &Arc<dyn MailProvider>,
+    em: &Emitter,
+    items: Vec<ArchiveItem>,
+    delete_after: bool,
+) {
     let account = app
         .account
         .as_ref()
@@ -1595,41 +1662,139 @@ fn archive(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, delete
     });
 }
 
+/// Bulk destructive actions above this many messages ask for confirmation.
+const CONFIRM_THRESHOLD: usize = 100;
+
 #[derive(Clone, Copy)]
 enum Action {
     Trash,
     Spam,
+    Read,
 }
 
-/// Trash/spam in the background so the UI never blocks on the network. The
-/// model updates when the `Removed` event arrives.
+impl Action {
+    fn present(self) -> &'static str {
+        match self {
+            Action::Trash => "Trashing",
+            Action::Spam => "Marking as spam",
+            Action::Read => "Marking read",
+        }
+    }
+    fn past(self) -> &'static str {
+        match self {
+            Action::Trash => "Trashed",
+            Action::Spam => "Marked as spam",
+            Action::Read => "Marked read",
+        }
+    }
+    fn confirm_verb(self) -> &'static str {
+        match self {
+            Action::Trash => "Trash",
+            Action::Spam => "Mark as spam",
+            Action::Read => "Mark read",
+        }
+    }
+    /// Whether the action removes messages from the inbox (and is undoable).
+    fn removes(self) -> bool {
+        matches!(self, Action::Trash | Action::Spam)
+    }
+}
+
+/// A destructive operation, possibly gated behind a confirmation.
+enum Pending {
+    Act(Action, Vec<String>, String),
+    Archive(Vec<ArchiveItem>, bool),
+    UnsubDelete(UnsubscribeInfo, Vec<String>, String),
+}
+
+/// The most recent removal, for one level of undo.
+struct UndoBatch {
+    ids: Vec<String>,
+    metas: Vec<MessageMeta>,
+}
+
+fn run_pending(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, pending: Pending) {
+    match pending {
+        Pending::Act(a, ids, label) => run_act(app, provider, em, a, ids, label),
+        Pending::Archive(items, del) => run_archive(app, provider, em, items, del),
+        Pending::UnsubDelete(info, ids, label) => {
+            run_unsubscribe(app, provider, em, info, ids, label, true)
+        }
+    }
+}
+
+/// Trash/spam/mark-read in the background so the UI never blocks. Trash/spam
+/// over the threshold confirm first; the model updates on the `Removed` event.
 fn act(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, action: Action) {
     let (ids, label) = app.action_ids();
     if ids.is_empty() {
         return;
     }
-    let n = ids.len();
-    let verb = match action {
-        Action::Trash => "Trash",
-        Action::Spam => "Spam",
-    };
-    app.notify(format!("{verb}ing {n} message(s) from {label}…"));
-    app.pending_ops += 1;
+    if action.removes() && ids.len() > CONFIRM_THRESHOLD {
+        let prompt = format!("{} {} message(s) from {label}?", action.confirm_verb(), ids.len());
+        app.pending = Some(Pending::Act(action, ids, label));
+        app.modal = Some(Modal::confirm(prompt));
+    } else {
+        run_act(app, provider, em, action, ids, label);
+    }
+}
 
+fn run_act(
+    app: &mut App,
+    provider: &Arc<dyn MailProvider>,
+    em: &Emitter,
+    action: Action,
+    ids: Vec<String>,
+    label: String,
+) {
+    let n = ids.len();
+    app.notify(format!("{} {n} message(s) from {label}…", action.present()));
+    app.pending_ops += 1;
     let provider = provider.clone();
     let em = em.clone();
     tokio::spawn(async move {
         let result = match action {
             Action::Trash => provider.trash(&ids).await,
             Action::Spam => provider.mark_spam(&ids).await,
+            Action::Read => provider.mark_read(&ids).await,
         };
         match result {
             Ok(()) => {
-                em.send(ScanEvent::Removed(ids.clone()));
-                em.send(ScanEvent::Notice(format!("{verb}ed {n} message(s) from {label}")));
+                if action.removes() {
+                    em.send(ScanEvent::Removed(ids.clone()));
+                }
+                em.send(ScanEvent::Notice(format!(
+                    "{} {n} message(s) from {label}",
+                    action.past()
+                )));
             }
-            Err(e) => em.send(ScanEvent::Notice(format!("{verb} failed: {e}"))),
+            Err(e) => em.send(ScanEvent::Notice(format!("Action failed: {e}"))),
         }
+        em.send(ScanEvent::OpDone);
+    });
+}
+
+/// Undo the most recent removal: re-add the messages locally and restore them
+/// to the inbox server-side.
+fn undo_last(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter) {
+    let Some(batch) = app.undo.take() else {
+        app.notify("Nothing to undo");
+        return;
+    };
+    let n = batch.ids.len();
+    app.metas.extend(batch.metas);
+    app.rebuild_groups();
+    app.notify(format!("Restoring {n} message(s)…"));
+    app.pending_ops += 1;
+    let provider = provider.clone();
+    let em = em.clone();
+    let ids = batch.ids;
+    tokio::spawn(async move {
+        let msg = match provider.restore(&ids).await {
+            Ok(()) => format!("Restored {n} message(s)"),
+            Err(e) => format!("Restore failed: {e}"),
+        };
+        em.send(ScanEvent::Notice(msg));
         em.send(ScanEvent::OpDone);
     });
 }
@@ -1650,6 +1815,24 @@ fn unsubscribe(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, de
     let label = target.label.clone();
     let ids = target.ids.clone();
 
+    if delete_after && ids.len() > CONFIRM_THRESHOLD {
+        let prompt = format!("Unsubscribe and delete {} message(s) from {label}?", ids.len());
+        app.pending = Some(Pending::UnsubDelete(info, ids, label));
+        app.modal = Some(Modal::confirm(prompt));
+        return;
+    }
+    run_unsubscribe(app, provider, em, info, ids, label, delete_after);
+}
+
+fn run_unsubscribe(
+    app: &mut App,
+    provider: &Arc<dyn MailProvider>,
+    em: &Emitter,
+    info: UnsubscribeInfo,
+    ids: Vec<String>,
+    label: String,
+    delete_after: bool,
+) {
     // Manual (non-one-click) methods open immediately.
     if !info.one_click {
         if info.http_url.is_some() {
@@ -1947,6 +2130,17 @@ fn render_modal(f: &mut Frame, modal: &Modal) {
                 Line::from(""),
                 Line::from(Span::styled(
                     "Enter to close",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ],
+        ),
+        ModalState::Confirm(prompt) => (
+            "Confirm",
+            vec![
+                Line::from(prompt.clone()),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "(y) yes    (n) no",
                     Style::default().fg(Color::DarkGray),
                 )),
             ],

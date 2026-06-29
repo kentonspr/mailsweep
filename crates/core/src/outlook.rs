@@ -494,6 +494,46 @@ impl MailProvider for OutlookClient {
         Ok(())
     }
 
+    async fn mark_read(&self, ids: &[String]) -> Result<()> {
+        for chunk in ids.chunks(BATCH_LIMIT) {
+            let requests: Vec<serde_json::Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    serde_json::json!({
+                        "id": i.to_string(),
+                        "method": "PATCH",
+                        "url": format!("/me/messages/{id}"),
+                        "headers": { "Content-Type": "application/json" },
+                        "body": { "isRead": true },
+                    })
+                })
+                .collect();
+            self.batch(requests).await?;
+        }
+        Ok(())
+    }
+
+    async fn restore(&self, ids: &[String]) -> Result<()> {
+        for chunk in ids.chunks(BATCH_LIMIT) {
+            let requests: Vec<serde_json::Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    serde_json::json!({
+                        "id": i.to_string(),
+                        "method": "POST",
+                        "url": format!("/me/messages/{id}/move"),
+                        "headers": { "Content-Type": "application/json" },
+                        "body": { "destinationId": "inbox" },
+                    })
+                })
+                .collect();
+            self.batch(requests).await?;
+        }
+        Ok(())
+    }
+
     async fn unsubscribe_one_click(&self, info: &UnsubscribeInfo) -> Result<bool> {
         crate::unsubscribe::one_click(&self.http, info).await
     }

@@ -91,8 +91,11 @@ First launch opens a browser for consent; the token is cached to
 - `Enter` — open the selected message in a scrollable viewer (`j`/`k` scroll, `Esc` close)
 - `a` — archive the marked set (or selected node) as `.eml` + attachments
 - `A` — archive **and** trash those messages
-- `d` trash · `s` mark spam · `u` unsubscribe — acts on the marked set, or the selected node
+- `d` trash · `s` mark spam · `r` mark read · `u` unsubscribe — acts on the marked set, or the selected node
+- `z` — undo the last delete (restores to inbox)
 - `?` — full key help · `q` — quit
+
+Bulk trash/spam/delete over 100 messages ask for a `y`/`n` confirmation.
 
 Views: **All** (everything), **Subscriptions** (senders with an unsubscribe
 header), **Attachments** (`has:attachment`). Sort each by message count, total

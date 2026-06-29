@@ -52,6 +52,12 @@ pub trait MailProvider: Send + Sync {
     /// Mark messages as spam/junk.
     async fn mark_spam(&self, ids: &[String]) -> Result<()>;
 
+    /// Mark messages as read.
+    async fn mark_read(&self, ids: &[String]) -> Result<()>;
+
+    /// Restore messages to the inbox (undo a trash/spam).
+    async fn restore(&self, ids: &[String]) -> Result<()>;
+
     /// Perform a one-click (RFC 8058) unsubscribe; `Ok(true)` on success.
     async fn unsubscribe_one_click(&self, info: &UnsubscribeInfo) -> Result<bool>;
 

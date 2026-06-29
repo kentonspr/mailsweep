@@ -297,11 +297,14 @@ impl GmailClient {
                 .await?
                 .error_for_status()?;
         }
-        // Keep the cache consistent with the inbox.
-        if let Some(cache) = &self.cache {
-            cache.remove(ids).await?;
-        }
         Ok(())
+    }
+
+    /// Drop messages from the local cache so it stays consistent with the inbox.
+    async fn evict(&self, ids: &[String]) {
+        if let Some(cache) = &self.cache {
+            cache.remove(ids).await.ok();
+        }
     }
 
     /// Convenience wrapper so frontends don't need a `reqwest` dependency.
@@ -521,11 +524,24 @@ impl MailProvider for GmailClient {
 
     async fn trash(&self, ids: &[String]) -> Result<()> {
         // Adding the TRASH label moves messages to trash (reversible).
-        self.batch_modify(ids, &["TRASH"], &["INBOX"]).await
+        self.batch_modify(ids, &["TRASH"], &["INBOX"]).await?;
+        self.evict(ids).await;
+        Ok(())
     }
 
     async fn mark_spam(&self, ids: &[String]) -> Result<()> {
-        self.batch_modify(ids, &["SPAM"], &["INBOX"]).await
+        self.batch_modify(ids, &["SPAM"], &["INBOX"]).await?;
+        self.evict(ids).await;
+        Ok(())
+    }
+
+    async fn mark_read(&self, ids: &[String]) -> Result<()> {
+        // Stays in the inbox; no cache eviction.
+        self.batch_modify(ids, &[], &["UNREAD"]).await
+    }
+
+    async fn restore(&self, ids: &[String]) -> Result<()> {
+        self.batch_modify(ids, &["INBOX"], &["TRASH", "SPAM"]).await
     }
 
     async fn unsubscribe_one_click(&self, info: &UnsubscribeInfo) -> Result<bool> {
