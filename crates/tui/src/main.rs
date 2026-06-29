@@ -1990,12 +1990,9 @@ fn render_accounts(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, email)| {
             let active = i == app.active;
             let marker = if active { "●" } else { " " };
-            // Live inbox count (decrements as you delete) + mailbox total.
+            // Live inbox count (decrements as you delete).
             let totals = if active {
-                match &app.account {
-                    Some(p) => format!("  ({} inbox · {} total)", app.metas.len(), p.messages_total),
-                    None => format!("  ({} inbox)", app.metas.len()),
-                }
+                format!("  ({} inbox)", app.metas.len())
             } else {
                 String::new()
             };
