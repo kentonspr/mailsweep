@@ -20,7 +20,8 @@ pub use gmail::{
     AttachmentInfo, FetchProgress, FetchReport, GmailClient, HistoryDelta, Profile,
 };
 pub use model::{
-    group_by_domain, group_messages, DomainGroup, MessageMeta, SenderEntry, SenderGroup,
+    group_by_domain, group_messages, DomainGroup, MessageBody, MessageMeta, SenderEntry,
+    SenderGroup,
 };
 pub use provider::{MailProvider, SyncResult};
 pub use unsubscribe::UnsubscribeInfo;

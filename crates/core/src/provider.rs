@@ -6,7 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::gmail::{AttachmentInfo, FetchProgress, FetchReport, Profile};
-use crate::model::MessageMeta;
+use crate::model::{MessageBody, MessageMeta};
 use crate::unsubscribe::UnsubscribeInfo;
 
 /// Result of an inbox sync, full or incremental.
@@ -64,4 +64,7 @@ pub trait MailProvider: Send + Sync {
 
     /// Download the full raw RFC 822 message (`.eml`), including attachments.
     async fn download_raw_message(&self, message_id: &str) -> Result<Vec<u8>>;
+
+    /// Fetch a message's readable body + headers for the in-app viewer.
+    async fn fetch_message_body(&self, message_id: &str) -> Result<MessageBody>;
 }

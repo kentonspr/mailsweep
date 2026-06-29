@@ -47,6 +47,42 @@ impl SenderGroup {
     }
 }
 
+/// The readable content of a single message (for the message viewer).
+#[derive(Debug, Clone, Default)]
+pub struct MessageBody {
+    pub subject: String,
+    pub from: String,
+    pub to: String,
+    pub date_ms: i64,
+    pub text: String,
+}
+
+/// Crudely convert HTML to readable plain text (strip tags, decode a few common
+/// entities). Good enough for a terminal message viewer.
+pub(crate) fn strip_html(html: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let out = out
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    out.lines()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// One sender (email address) within a domain, holding its messages.
 #[derive(Debug, Clone)]
 pub struct SenderEntry {

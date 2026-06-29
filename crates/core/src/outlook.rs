@@ -18,7 +18,7 @@ use tokio::time::sleep;
 use crate::auth::AuthPrompt;
 use crate::cache::Cache;
 use crate::gmail::{AttachmentInfo, FetchProgress, FetchReport, Profile};
-use crate::model::MessageMeta;
+use crate::model::{strip_html, MessageBody, MessageMeta};
 use crate::provider::{MailProvider, ProgressCallback, SyncResult};
 use crate::unsubscribe::UnsubscribeInfo;
 
@@ -556,6 +556,50 @@ impl MailProvider for OutlookClient {
             .await?;
         Ok(bytes.to_vec())
     }
+
+    async fn fetch_message_body(&self, message_id: &str) -> Result<MessageBody> {
+        let bearer = self.bearer().await?;
+        let m: GraphFullMessage = self
+            .http
+            .get(format!(
+                "{GRAPH}/me/messages/{message_id}?$select=subject,from,toRecipients,receivedDateTime,body"
+            ))
+            .header("Authorization", &bearer)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let from = m
+            .from
+            .and_then(|r| r.email_address.address)
+            .unwrap_or_default();
+        let to = m
+            .to_recipients
+            .into_iter()
+            .filter_map(|r| r.email_address.address)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let date_ms = m
+            .received_date_time
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(0);
+        let text = match m.body {
+            Some(b) if b.content_type.eq_ignore_ascii_case("html") => strip_html(&b.content),
+            Some(b) => b.content,
+            None => String::new(),
+        };
+        Ok(MessageBody {
+            subject: m.subject.unwrap_or_default(),
+            from,
+            to,
+            date_ms,
+            text,
+        })
+    }
 }
 
 fn meta_from_graph(msg: GraphMessage) -> MessageMeta {
@@ -701,4 +745,28 @@ struct GraphAttachment {
     content_type: Option<String>,
     #[serde(default)]
     size: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphFullMessage {
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    from: Option<Recipient>,
+    #[serde(default)]
+    to_recipients: Vec<Recipient>,
+    #[serde(default)]
+    received_date_time: Option<String>,
+    #[serde(default)]
+    body: Option<GraphBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphBody {
+    #[serde(default)]
+    content_type: String,
+    #[serde(default)]
+    content: String,
 }

@@ -49,7 +49,7 @@ const HELP_FULL: &str = "Keys\n\
     h / l  (or arrows)    Collapse / expand the tree\n\
     <Space>               Marks / unmarks the selection\n\
     c                     Clears all selections\n\
-    <Enter>               Loads attachments (Accounts panel: switch / add)\n\
+    <Enter>               Opens the message (Accounts panel: switch / add)\n\
     a                     Archives the selection (.eml + attachments)\n\
     A                     Archives and deletes the selection\n\
     d                     Trashes the selection\n\
@@ -88,6 +88,8 @@ enum ScanEvent {
     },
     /// All attachment sizes are loaded — do a final re-sort.
     AttachmentsSettled,
+    /// A fetched message body for the viewer: (subject, rendered lines) or error.
+    MessageBody(Result<(String, Vec<String>), String>),
 }
 
 /// Sends scan events tagged with the account "epoch" they belong to, so events
@@ -143,6 +145,12 @@ enum ModalState {
     },
     /// Final message; dismiss with Enter/Esc.
     Message(String),
+    /// Scrollable full-message viewer.
+    MessageView {
+        title: String,
+        lines: Vec<String>,
+        scroll: u16,
+    },
 }
 
 impl Modal {
@@ -169,6 +177,26 @@ impl Modal {
     fn message(text: String) -> Self {
         Modal {
             state: ModalState::Message(text),
+        }
+    }
+
+    fn message_loading() -> Self {
+        Modal {
+            state: ModalState::MessageView {
+                title: "Message".to_string(),
+                lines: vec!["Loading…".to_string()],
+                scroll: 0,
+            },
+        }
+    }
+
+    fn message_view(title: String, lines: Vec<String>) -> Self {
+        Modal {
+            state: ModalState::MessageView {
+                title,
+                lines,
+                scroll: 0,
+            },
         }
     }
 }
@@ -399,6 +427,20 @@ impl App {
                 self.attach_active = false;
                 if self.view == View::Attachments {
                     self.rebuild_groups();
+                }
+            }
+            ScanEvent::MessageBody(res) => {
+                // Only replace the modal if a viewer is still open for it.
+                if matches!(
+                    &self.modal,
+                    Some(Modal {
+                        state: ModalState::MessageView { .. }
+                    })
+                ) {
+                    self.modal = Some(match res {
+                        Ok((title, lines)) => Modal::message_view(title, lines),
+                        Err(e) => Modal::message(format!("Could not load message: {e}")),
+                    });
                 }
             }
             ScanEvent::AuthPrompt(new_lines) => {
@@ -1258,6 +1300,18 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
                 KeyCode::Enter | KeyCode::Esc => Act::Close,
                 _ => Act::None,
             },
+            ModalState::MessageView { scroll, .. } => match code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => Act::Close,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    *scroll = scroll.saturating_add(1);
+                    Act::None
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    *scroll = scroll.saturating_sub(1);
+                    Act::None
+                }
+                _ => Act::None,
+            },
         }
     };
 
@@ -1325,7 +1379,9 @@ async fn handle_key(
             if app.focus == Panel::Accounts {
                 return app.account_enter();
             }
-            load_attachments(app, provider.as_ref()).await;
+            if let Some(id) = app.selected_message_id() {
+                open_message(app, provider, em, id);
+            }
         }
         KeyCode::Char('a') => archive(app, provider, em, false),
         KeyCode::Char('A') => archive(app, provider, em, true),
@@ -1337,19 +1393,28 @@ async fn handle_key(
     KeyOutcome::None
 }
 
-async fn load_attachments(app: &mut App, provider: &dyn MailProvider) {
-    let Some(id) = app.selected_message_id() else { return };
-    if app.attachments.contains_key(&id) {
-        return;
-    }
-    app.status = "Loading attachments…".to_string();
-    match provider.message_attachments(&id).await {
-        Ok(list) => {
-            app.attachments.insert(id, list);
-            app.status = HELP.to_string();
-        }
-        Err(e) => app.status = format!("Attachment load failed: {e}"),
-    }
+/// Open the message viewer: show a loading modal and fetch the body in the
+/// background; the result arrives as a `MessageBody` event.
+fn open_message(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, id: String) {
+    app.modal = Some(Modal::message_loading());
+    let provider = provider.clone();
+    let em = em.clone();
+    tokio::spawn(async move {
+        let res = match provider.fetch_message_body(&id).await {
+            Ok(b) => {
+                let mut lines = vec![
+                    format!("From: {}", b.from),
+                    format!("To:   {}", b.to),
+                    format!("Date: {}", fmt_date(b.date_ms)),
+                    String::new(),
+                ];
+                lines.extend(b.text.lines().map(str::to_string));
+                Ok((b.subject, lines))
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        em.send(ScanEvent::MessageBody(res));
+    });
 }
 
 fn archive(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, delete_after: bool) {
@@ -1531,10 +1596,35 @@ fn centered_rect(px: u16, py: u16, r: Rect) -> Rect {
 }
 
 fn render_modal(f: &mut Frame, modal: &Modal) {
+    // The message viewer is large and scrollable.
+    if let ModalState::MessageView {
+        title,
+        lines,
+        scroll,
+    } = &modal.state
+    {
+        let area = centered_rect(82, 84, f.area());
+        f.render_widget(Clear, area);
+        let body: Vec<Line> = lines.iter().map(|l| Line::from(l.clone())).collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(format!("{title}  ·  j/k scroll · Esc close"));
+        f.render_widget(
+            Paragraph::new(body)
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .scroll((*scroll, 0)),
+            area,
+        );
+        return;
+    }
+
     let area = centered_rect(64, 50, f.area());
     f.render_widget(Clear, area);
 
     let (title, lines): (&str, Vec<Line>) = match &modal.state {
+        ModalState::MessageView { .. } => unreachable!("handled above"),
         ModalState::Credential {
             provider,
             input,
@@ -1910,7 +2000,7 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                 }
                 Some(_) => lines.push(Line::from("No attachments on this message.")),
                 None if app.attachment_ids.contains(&m.id) => {
-                    lines.push(Line::from("Has attachments — press Enter to load details."))
+                    lines.push(Line::from("Attachments loading…"))
                 }
                 None => {}
             }

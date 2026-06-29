@@ -86,7 +86,7 @@ First launch opens a browser for consent; the token is cached to
 - `j`/`k` (or `↑`/`↓`) — move within the focused panel (or scroll Details)
 - `h`/`l` (or `←`/`→`) — collapse / expand the tree (domain → sender → message)
 - `Space` — mark/unmark the selected node; `c` — clear all marks
-- `Enter` — load the selected message's attachment list into Details
+- `Enter` — open the selected message in a scrollable viewer (`j`/`k` scroll, `Esc` close)
 - `a` — archive the marked set (or selected node) as `.eml` + attachments
 - `A` — archive **and** trash those messages
 - `d` trash · `s` mark spam · `u` unsubscribe — acts on the marked set, or the selected node

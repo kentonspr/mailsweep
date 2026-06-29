@@ -19,7 +19,7 @@ use tokio::time::sleep;
 
 use crate::auth::GmailAuth;
 use crate::cache::Cache;
-use crate::model::MessageMeta;
+use crate::model::{strip_html, MessageBody, MessageMeta};
 use crate::provider::{MailProvider, ProgressCallback, SyncResult};
 use crate::unsubscribe::UnsubscribeInfo;
 
@@ -560,6 +560,49 @@ impl MailProvider for GmailClient {
             .decode(resp.raw.as_bytes())
             .map_err(|e| anyhow!("decoding raw message: {e}"))
     }
+
+    async fn fetch_message_body(&self, message_id: &str) -> Result<MessageBody> {
+        let bearer = self.bearer().await?;
+        let resp: FullMessageResp = self
+            .http
+            .get(format!("{BASE}/messages/{message_id}"))
+            .header("Authorization", &bearer)
+            .query(&[("format", "full")])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let p = &resp.payload;
+        let text = part_text(p, "text/plain")
+            .or_else(|| part_text(p, "text/html").map(|h| strip_html(&h)))
+            .unwrap_or_default();
+        Ok(MessageBody {
+            subject: header(&p.headers, "Subject").unwrap_or("(no subject)").to_string(),
+            from: header(&p.headers, "From").unwrap_or_default().to_string(),
+            to: header(&p.headers, "To").unwrap_or_default().to_string(),
+            date_ms: resp.internal_date.parse().unwrap_or(0),
+            text,
+        })
+    }
+}
+
+/// Find the first decoded body part of the given MIME type in the tree.
+fn part_text(part: &FullPart, mime: &str) -> Option<String> {
+    if part.mime_type.eq_ignore_ascii_case(mime) {
+        if let Some(data) = &part.body.data {
+            if let Ok(bytes) = base64_url().decode(data.as_bytes()) {
+                return Some(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+    }
+    for child in &part.parts {
+        if let Some(t) = part_text(child, mime) {
+            return Some(t);
+        }
+    }
+    None
 }
 
 /// Issue a single Gmail batch request for up to `BATCH_GET_LIMIT` messages.
@@ -776,7 +819,10 @@ struct HistMessage {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FullMessageResp {
+    #[serde(default)]
+    internal_date: String,
     #[serde(default)]
     payload: FullPart,
 }
@@ -788,6 +834,8 @@ struct FullPart {
     filename: String,
     #[serde(default)]
     mime_type: String,
+    #[serde(default)]
+    headers: Vec<HeaderField>,
     #[serde(default)]
     body: PartBody,
     #[serde(default)]
@@ -801,6 +849,8 @@ struct PartBody {
     attachment_id: Option<String>,
     #[serde(default)]
     size: u64,
+    #[serde(default)]
+    data: Option<String>,
 }
 
 #[derive(Deserialize)]
