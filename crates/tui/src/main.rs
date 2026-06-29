@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -81,6 +81,8 @@ enum ScanEvent {
     AuthPrompt(Vec<String>),
     /// Sign-in finished: the new account email, or an error.
     AuthDone(accounts::Provider, Result<String, String>),
+    /// All attachment sizes are loaded — do a final re-sort.
+    AttachmentsSettled,
 }
 
 /// Sends scan events tagged with the account "epoch" they belong to, so events
@@ -285,6 +287,8 @@ struct App {
     status: String,
     /// Add-account wizard, when open.
     modal: Option<Modal>,
+    /// Throttles re-sorting while attachment sizes stream in.
+    last_attach_sort: Instant,
 }
 
 impl App {
@@ -313,6 +317,7 @@ impl App {
             },
             status: HELP.to_string(),
             modal: None,
+            last_attach_sort: Instant::now(),
         }
     }
 
@@ -361,8 +366,17 @@ impl App {
             ScanEvent::Removed(ids) => self.remove_messages(&ids),
             ScanEvent::AttachmentDetails(id, list) => {
                 self.attachments.insert(id, list);
-                // Re-sort so newly-known sizes take effect in the Attachments view.
-                if self.view == View::Attachments && self.sort == SortMode::Size {
+                // Re-sort as sizes arrive, but throttle to avoid constant churn.
+                if self.view == View::Attachments
+                    && self.sort == SortMode::Size
+                    && self.last_attach_sort.elapsed() > Duration::from_secs(1)
+                {
+                    self.rebuild_groups();
+                    self.last_attach_sort = Instant::now();
+                }
+            }
+            ScanEvent::AttachmentsSettled => {
+                if self.view == View::Attachments {
                     self.rebuild_groups();
                 }
             }
@@ -440,12 +454,14 @@ impl App {
     /// per-message size estimate.
     fn msg_size(&self, m: &MessageMeta) -> u64 {
         if self.view == View::Attachments {
-            if let Some(atts) = self.attachments.get(&m.id) {
-                let total: u64 = atts.iter().map(|a| a.size).sum();
-                if total > 0 {
-                    return total;
-                }
-            }
+            // Real attachment bytes once known; 0 (unknown) until the background
+            // fetch loads them — never the whole-message estimate, which would
+            // start high and visibly correct downward.
+            return self
+                .attachments
+                .get(&m.id)
+                .map(|atts| atts.iter().map(|a| a.size).sum())
+                .unwrap_or(0);
         }
         m.size_estimate
     }
@@ -940,6 +956,7 @@ async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache) {
         em.send(ScanEvent::Notice(format!(
             "Attachment sizes loaded ({total} messages)"
         )));
+        em.send(ScanEvent::AttachmentsSettled);
     }
 }
 
