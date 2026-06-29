@@ -101,6 +101,8 @@ enum ScanEvent {
     AttachmentsSettled,
     /// A fetched message body for the viewer: (subject, rendered lines) or error.
     MessageBody(Result<(String, Vec<String>), String>),
+    /// A background operation (trash/spam/unsubscribe/archive) finished.
+    OpDone,
 }
 
 /// Sends scan events tagged with the account "epoch" they belong to, so events
@@ -344,7 +346,12 @@ struct App {
     detail_scroll: u16,
     focus: Panel,
     sync: SyncState,
-    status: String,
+    /// Recent action/notice messages (newest last).
+    history: Vec<String>,
+    /// Number of in-flight background operations (drives the spinner).
+    pending_ops: usize,
+    /// Advances each frame to animate the spinner.
+    tick: u64,
     /// Add-account wizard, when open.
     modal: Option<Modal>,
     /// Throttles re-sorting while attachment sizes stream in.
@@ -383,7 +390,9 @@ impl App {
                 message: "Starting…".to_string(),
                 ..SyncState::default()
             },
-            status: HELP.to_string(),
+            history: Vec::new(),
+            pending_ops: 0,
+            tick: 0,
             modal: None,
             last_attach_sort: Instant::now(),
             attach_active: false,
@@ -411,7 +420,17 @@ impl App {
             message: "Starting…".to_string(),
             ..SyncState::default()
         };
-        self.status = HELP.to_string();
+        self.history.clear();
+        self.pending_ops = 0;
+    }
+
+    /// Append a message to the activity history.
+    fn notify(&mut self, msg: impl Into<String>) {
+        self.history.push(msg.into());
+        const MAX: usize = 200;
+        if self.history.len() > MAX {
+            self.history.drain(0..self.history.len() - MAX);
+        }
     }
 
     /// Enter in the Accounts panel switches to the highlighted account.
@@ -470,7 +489,8 @@ impl App {
         match event {
             ScanEvent::Account(p) => self.account = Some(p),
             ScanEvent::Status(s) => self.sync.message = s,
-            ScanEvent::Notice(s) => self.status = s,
+            ScanEvent::Notice(s) => self.notify(s),
+            ScanEvent::OpDone => self.pending_ops = self.pending_ops.saturating_sub(1),
             ScanEvent::Removed(ids) => self.remove_messages(&ids),
             ScanEvent::AttachmentDetails(id, list) => {
                 self.attachments.insert(id, list);
@@ -1195,6 +1215,7 @@ async fn event_loop<B: Backend + io::Write>(
     mut rx: UnboundedReceiver<(u64, ScanEvent)>,
 ) -> Result<()> {
     loop {
+        app.tick = app.tick.wrapping_add(1);
         while let Ok((ep, event)) = rx.try_recv() {
             match event {
                 // Auth events are not account-scoped; always handle them.
@@ -1463,11 +1484,11 @@ async fn handle_key(
         KeyCode::Char('o') => {
             app.sort = app.sort.next();
             app.rebuild_groups();
-            app.status = format!("Sort: {}", app.sort.label());
+            app.notify(format!("Sort: {}", app.sort.label()));
         }
         KeyCode::Char('c') => {
             app.marked.clear();
-            app.status = "Cleared all selections".to_string();
+            app.notify("Cleared all selections");
         }
         KeyCode::Char('?') => app.modal = Some(Modal::help()),
         KeyCode::Enter => match app.focus {
@@ -1481,9 +1502,9 @@ async fn handle_key(
         },
         KeyCode::Char('a') => archive(app, provider, em, false),
         KeyCode::Char('A') => archive(app, provider, em, true),
-        KeyCode::Char('d') => act(app, provider.as_ref(), Action::Trash).await,
-        KeyCode::Char('s') => act(app, provider.as_ref(), Action::Spam).await,
-        KeyCode::Char('u') => app.status = unsubscribe(app, provider.as_ref()).await,
+        KeyCode::Char('d') => act(app, provider, em, Action::Trash),
+        KeyCode::Char('s') => act(app, provider, em, Action::Spam),
+        KeyCode::Char('u') => unsubscribe(app, provider, em),
         _ => {}
     }
     KeyOutcome::None
@@ -1516,7 +1537,7 @@ fn open_message(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, i
 fn archive(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, delete_after: bool) {
     let items = app.archive_items();
     if items.is_empty() {
-        app.status = "Nothing to archive in selection".to_string();
+        app.notify("Nothing to archive in selection");
         return;
     }
     let account = app
@@ -1531,7 +1552,8 @@ fn archive(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, delete
     let path = config::archive_dir().join(format!("{account}-{ts}.zip"));
 
     let verb = if delete_after { "Archiving + deleting" } else { "Archiving" };
-    app.status = format!("{verb} {} message(s)…", items.len());
+    app.notify(format!("{verb} {} message(s)…", items.len()));
+    app.pending_ops += 1;
     let provider = provider.clone();
     let em = em.clone();
     tokio::spawn(async move {
@@ -1567,6 +1589,7 @@ fn archive(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, delete
             Err(e) => format!("Archive failed: {e}"),
         };
         em.send(ScanEvent::Notice(msg));
+        em.send(ScanEvent::OpDone);
     });
 }
 
@@ -1576,56 +1599,77 @@ enum Action {
     Spam,
 }
 
-async fn act(app: &mut App, provider: &dyn MailProvider, action: Action) {
+/// Trash/spam in the background so the UI never blocks on the network. The
+/// model updates when the `Removed` event arrives.
+fn act(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, action: Action) {
     let (ids, label) = app.action_ids();
     if ids.is_empty() {
         return;
     }
     let n = ids.len();
-
-    let result = match action {
-        Action::Trash => provider.trash(&ids).await,
-        Action::Spam => provider.mark_spam(&ids).await,
-    };
     let verb = match action {
-        Action::Trash => "Trashed",
-        Action::Spam => "Marked as spam",
+        Action::Trash => "Trash",
+        Action::Spam => "Spam",
     };
+    app.notify(format!("{verb}ing {n} message(s) from {label}…"));
+    app.pending_ops += 1;
 
-    app.status = match result {
-        Ok(()) => {
-            app.remove_messages(&ids);
-            format!("{verb} {n} message(s) from {label}")
+    let provider = provider.clone();
+    let em = em.clone();
+    tokio::spawn(async move {
+        let result = match action {
+            Action::Trash => provider.trash(&ids).await,
+            Action::Spam => provider.mark_spam(&ids).await,
+        };
+        match result {
+            Ok(()) => {
+                em.send(ScanEvent::Removed(ids.clone()));
+                em.send(ScanEvent::Notice(format!("{verb}ed {n} message(s) from {label}")));
+            }
+            Err(e) => em.send(ScanEvent::Notice(format!("{verb} failed: {e}"))),
         }
-        Err(e) => format!("Action failed: {e}"),
-    };
+        em.send(ScanEvent::OpDone);
+    });
 }
 
-async fn unsubscribe(app: &App, provider: &dyn MailProvider) -> String {
+/// Unsubscribe. The one-click POST runs in the background; opening a web/mail
+/// link is instant and done inline.
+fn unsubscribe(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter) {
     let Some(target) = app.target() else {
-        return "Nothing selected".to_string();
+        app.notify("Nothing selected");
+        return;
     };
-    let Some(info) = &target.unsubscribe else {
-        return format!("No unsubscribe info for {}", target.label);
+    let Some(info) = target.unsubscribe.clone() else {
+        app.notify(format!("No unsubscribe info for {}", target.label));
+        return;
     };
+    let label = target.label.clone();
 
     if info.one_click {
-        match provider.unsubscribe_one_click(info).await {
-            Ok(true) => return format!("Unsubscribed from {} (one-click)", target.label),
-            Ok(false) => {}
-            Err(e) => return format!("One-click unsubscribe failed: {e}"),
-        }
-    }
-
-    if info.http_url.is_some() {
-        match mailsweep_core::unsubscribe::open_in_browser(info) {
-            Ok(()) => format!("Opened unsubscribe page for {}", target.label),
-            Err(e) => format!("Could not open browser: {e}"),
-        }
+        app.notify(format!("Unsubscribing from {label}…"));
+        app.pending_ops += 1;
+        let provider = provider.clone();
+        let em = em.clone();
+        tokio::spawn(async move {
+            let msg = match provider.unsubscribe_one_click(&info).await {
+                Ok(true) => format!("Unsubscribed from {label} (one-click)"),
+                Ok(false) | Err(_) if info.http_url.is_some() => {
+                    let _ = mailsweep_core::unsubscribe::open_in_browser(&info);
+                    format!("Opened unsubscribe page for {label}")
+                }
+                Ok(false) => format!("No one-click unsubscribe for {label}"),
+                Err(e) => format!("Unsubscribe failed: {e}"),
+            };
+            em.send(ScanEvent::Notice(msg));
+            em.send(ScanEvent::OpDone);
+        });
+    } else if info.http_url.is_some() {
+        let _ = mailsweep_core::unsubscribe::open_in_browser(&info);
+        app.notify(format!("Opened unsubscribe page for {label}"));
     } else if let Some(mailto) = &info.mailto {
-        format!("Unsubscribe by emailing: {mailto}")
+        app.notify(format!("Unsubscribe by emailing: {mailto}"));
     } else {
-        format!("No usable unsubscribe method for {}", target.label)
+        app.notify(format!("No usable unsubscribe method for {label}"));
     }
 }
 
@@ -1650,7 +1694,10 @@ fn ui(f: &mut Frame, app: &App) {
     let body = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(rows[1]);
     render_domains(f, app, body[0]);
-    render_details(f, app, body[1]);
+    // Right column: Details on top, a small Activity panel at the bottom.
+    let right = Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).split(body[1]);
+    render_details(f, app, right[0]);
+    render_history(f, app, right[1]);
 
     let status = if app.searching {
         Line::from(vec![
@@ -1662,13 +1709,47 @@ fn ui(f: &mut Frame, app: &App) {
             ),
         ])
     } else {
-        Line::from(app.status.clone())
+        Line::from(Span::styled(HELP, Style::default().fg(Color::DarkGray)))
     };
     f.render_widget(Paragraph::new(status), rows[2]);
 
     if let Some(modal) = &app.modal {
         render_modal(f, modal);
     }
+}
+
+fn render_history(f: &mut Frame, app: &App, area: Rect) {
+    let busy = app.pending_ops > 0;
+    let title = if busy {
+        format!("Activity ({} running)", app.pending_ops)
+    } else {
+        "Activity".to_string()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let height = inner.height as usize;
+    let reserve = usize::from(busy);
+    let avail = height.saturating_sub(reserve);
+    let start = app.history.len().saturating_sub(avail);
+    let mut lines: Vec<Line> = app.history[start..]
+        .iter()
+        .map(|m| Line::from(m.clone()))
+        .collect();
+
+    if busy {
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let frame = FRAMES[(app.tick as usize) % FRAMES.len()];
+        lines.push(Line::from(Span::styled(
+            format!("{frame} working…"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_config(f: &mut Frame, app: &App, area: Rect) {
