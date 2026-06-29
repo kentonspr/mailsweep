@@ -56,7 +56,8 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("Space", "Mark / unmark the selection"),
     ("c", "Clear all selections"),
     ("a / A", "Archive / archive + delete"),
-    ("d / s / u", "Trash / spam / unsubscribe"),
+    ("d / s", "Trash / spam"),
+    ("u / U", "Unsubscribe / unsubscribe + delete"),
     ("?", "Show this help"),
     ("q", "Quit"),
 ];
@@ -1504,7 +1505,8 @@ async fn handle_key(
         KeyCode::Char('A') => archive(app, provider, em, true),
         KeyCode::Char('d') => act(app, provider, em, Action::Trash),
         KeyCode::Char('s') => act(app, provider, em, Action::Spam),
-        KeyCode::Char('u') => unsubscribe(app, provider, em),
+        KeyCode::Char('u') => unsubscribe(app, provider, em, false),
+        KeyCode::Char('U') => unsubscribe(app, provider, em, true),
         _ => {}
     }
     KeyOutcome::None
@@ -1632,9 +1634,11 @@ fn act(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, action: Ac
     });
 }
 
-/// Unsubscribe. The one-click POST runs in the background; opening a web/mail
-/// link is instant and done inline.
-fn unsubscribe(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter) {
+/// Unsubscribe, optionally trashing the target's messages afterward.
+///
+/// One-click POST and the (optional) trash run in the background; opening a
+/// web/mail link is instant and done inline.
+fn unsubscribe(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, delete_after: bool) {
     let Some(target) = app.target() else {
         app.notify("Nothing selected");
         return;
@@ -1644,32 +1648,54 @@ fn unsubscribe(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter) {
         return;
     };
     let label = target.label.clone();
+    let ids = target.ids.clone();
 
-    if info.one_click {
-        app.notify(format!("Unsubscribing from {label}…"));
+    // Manual (non-one-click) methods open immediately.
+    if !info.one_click {
+        if info.http_url.is_some() {
+            let _ = mailsweep_core::unsubscribe::open_in_browser(&info);
+            app.notify(format!("Opened unsubscribe page for {label}"));
+        } else if let Some(mailto) = &info.mailto {
+            app.notify(format!("Unsubscribe by emailing: {mailto}"));
+        } else {
+            app.notify(format!("No usable unsubscribe method for {label}"));
+        }
+    }
+
+    // Background: the one-click POST and/or the trash.
+    if info.one_click || delete_after {
+        if info.one_click {
+            app.notify(format!("Unsubscribing from {label}…"));
+        }
+        if delete_after {
+            app.notify(format!("Deleting {} message(s) from {label}…", ids.len()));
+        }
         app.pending_ops += 1;
         let provider = provider.clone();
         let em = em.clone();
         tokio::spawn(async move {
-            let msg = match provider.unsubscribe_one_click(&info).await {
-                Ok(true) => format!("Unsubscribed from {label} (one-click)"),
-                Ok(false) | Err(_) if info.http_url.is_some() => {
-                    let _ = mailsweep_core::unsubscribe::open_in_browser(&info);
-                    format!("Opened unsubscribe page for {label}")
+            if info.one_click {
+                let msg = match provider.unsubscribe_one_click(&info).await {
+                    Ok(true) => format!("Unsubscribed from {label} (one-click)"),
+                    Ok(false) => format!("One-click unsubscribe not accepted for {label}"),
+                    Err(e) => format!("Unsubscribe failed: {e}"),
+                };
+                em.send(ScanEvent::Notice(msg));
+            }
+            if delete_after {
+                match provider.trash(&ids).await {
+                    Ok(()) => {
+                        em.send(ScanEvent::Removed(ids.clone()));
+                        em.send(ScanEvent::Notice(format!(
+                            "Trashed {} message(s) from {label}",
+                            ids.len()
+                        )));
+                    }
+                    Err(e) => em.send(ScanEvent::Notice(format!("Trash failed: {e}"))),
                 }
-                Ok(false) => format!("No one-click unsubscribe for {label}"),
-                Err(e) => format!("Unsubscribe failed: {e}"),
-            };
-            em.send(ScanEvent::Notice(msg));
+            }
             em.send(ScanEvent::OpDone);
         });
-    } else if info.http_url.is_some() {
-        let _ = mailsweep_core::unsubscribe::open_in_browser(&info);
-        app.notify(format!("Opened unsubscribe page for {label}"));
-    } else if let Some(mailto) = &info.mailto {
-        app.notify(format!("Unsubscribe by emailing: {mailto}"));
-    } else {
-        app.notify(format!("No usable unsubscribe method for {label}"));
     }
 }
 
