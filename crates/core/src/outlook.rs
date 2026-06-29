@@ -666,7 +666,7 @@ impl MailProvider for OutlookClient {
 }
 
 fn meta_from_graph(msg: GraphMessage) -> MessageMeta {
-    let (from_name, from_email) = match msg.from.and_then(|f| Some(f.email_address)) {
+    let (from_name, from_email) = match msg.from.map(|f| f.email_address) {
         Some(addr) => (addr.name, addr.address.unwrap_or_default()),
         None => (None, String::new()),
     };

@@ -1,5 +1,6 @@
 //! Provider-agnostic message metadata and sender grouping.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::unsubscribe::{self, UnsubscribeInfo};
@@ -166,10 +167,9 @@ pub fn group_messages(messages: &[MessageMeta]) -> Vec<DomainGroup> {
         .map(|(domain, senders_map)| {
             let mut senders: Vec<SenderEntry> = senders_map.into_values().collect();
             for s in &mut senders {
-                s.messages
-                    .sort_by(|a, b| b.internal_date.cmp(&a.internal_date));
+                s.messages.sort_by_key(|m| Reverse(m.internal_date));
             }
-            senders.sort_by(|a, b| b.count().cmp(&a.count()));
+            senders.sort_by_key(|s| Reverse(s.count()));
             let unsubscribe = senders.iter().find_map(|s| s.unsubscribe.clone());
             DomainGroup {
                 domain,
@@ -178,7 +178,7 @@ pub fn group_messages(messages: &[MessageMeta]) -> Vec<DomainGroup> {
             }
         })
         .collect();
-    groups.sort_by(|a, b| b.count().cmp(&a.count()));
+    groups.sort_by_key(|g| Reverse(g.count()));
     groups
 }
 
@@ -208,6 +208,6 @@ pub fn group_by_domain(messages: &[MessageMeta]) -> Vec<SenderGroup> {
     }
 
     let mut groups: Vec<SenderGroup> = map.into_values().collect();
-    groups.sort_by(|a, b| b.count().cmp(&a.count()));
+    groups.sort_by_key(|g| Reverse(g.count()));
     groups
 }
