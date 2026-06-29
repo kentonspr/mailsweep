@@ -3,6 +3,10 @@ name = "mailsweep-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+description = "Core library for Mailsweep: mail providers (Gmail/Outlook), sync, caching, and archiving."
+keywords = ["email", "gmail", "outlook", "cleanup"]
+categories = ["email", "api-bindings"]
 
 [dependencies]
 tokio.workspace = true

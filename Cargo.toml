@@ -6,6 +6,8 @@ members = ["crates/core", "crates/tui"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+authors = ["Mailsweep contributors"]
+# repository = "https://github.com/<you>/mailsweep"  # set before publishing
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
