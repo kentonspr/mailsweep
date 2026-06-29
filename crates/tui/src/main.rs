@@ -31,6 +31,8 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 use mailsweep_core::outlook::{MsAuth, OutlookClient};
 use mailsweep_core::{
     accounts, archive_messages, config, group_messages, ArchiveItem, ArchiveScope, AttachmentInfo,
@@ -39,25 +41,34 @@ use mailsweep_core::{
 };
 
 const HELP: &str =
-    "<Tab> view · o sort · j/k move · h/l fold · <Space> mark · ? help · q quit";
+    "/ search · o sort · j/k move · h/l fold · <Space> mark · ? help · q quit";
 
-const HELP_FULL: &str = "Keys\n\
-    \n\
-    <Tab> / <Shift-Tab>   Switch view (All / Subscriptions / Attachments)\n\
-    o                     Cycle sort (Messages / Size / Recent)\n\
-    j / k  (or arrows)    Move within the focused panel\n\
-    h / l  (or arrows)    Collapse / expand the tree\n\
-    <Space>               Marks / unmarks the selection\n\
-    c                     Clears all selections\n\
-    <Enter>               Opens the message (Accounts panel: switch / add)\n\
-    a                     Archives the selection (.eml + attachments)\n\
-    A                     Archives and deletes the selection\n\
-    d                     Trashes the selection\n\
-    s                     Marks the selection as spam\n\
-    u                     Unsubscribes from the selection\n\
-    1 / 2 / 3 / 4         Focus Accounts / Config / Domains / Details\n\
-    ?                     Shows this help\n\
-    q                     Quits";
+/// (keys, description) rows for the `?` help modal.
+const HELP_KEYS: &[(&str, &str)] = &[
+    ("1 2 3 4", "Focus Accounts / Config / Domains / Details"),
+    ("Tab / S-Tab", "Switch view (All / Subscriptions / Attachments)"),
+    ("o", "Cycle sort (Messages / Size / Recent)"),
+    ("/", "Search / filter the list"),
+    ("j / k", "Move down / up"),
+    ("g g / G", "Jump to top / bottom"),
+    ("h / l", "Collapse / expand the tree"),
+    ("Enter", "Open the selected message"),
+    ("Space", "Mark / unmark the selection"),
+    ("c", "Clear all selections"),
+    ("a / A", "Archive / archive + delete"),
+    ("d / s / u", "Trash / spam / unsubscribe"),
+    ("?", "Show this help"),
+    ("q", "Quit"),
+];
+
+/// Config panel rows: set Gmail cred, set Outlook cred, add Gmail, add Outlook.
+const CONFIG_ITEMS: usize = 4;
+const CONFIG_LABELS: [&str; CONFIG_ITEMS] = [
+    "Set Gmail credential",
+    "Set Outlook credential",
+    "+ Add Gmail account",
+    "+ Add Outlook account",
+];
 
 /// Messages streamed from the background scan / archive tasks into the UI.
 enum ScanEvent {
@@ -151,6 +162,8 @@ enum ModalState {
         lines: Vec<String>,
         scroll: u16,
     },
+    /// Key reference.
+    Help,
 }
 
 impl Modal {
@@ -197,6 +210,12 @@ impl Modal {
                 lines,
                 scroll: 0,
             },
+        }
+    }
+
+    fn help() -> Self {
+        Modal {
+            state: ModalState::Help,
         }
     }
 }
@@ -298,10 +317,18 @@ struct App {
     /// Configured account emails; `active` indexes the one being shown.
     accounts: Vec<String>,
     active: usize,
-    /// Cursor within the Accounts panel (== accounts.len() means "+ Add").
+    /// Cursor within the Accounts panel (selecting a configured account).
     account_cursor: usize,
+    /// Cursor within the Config panel.
+    config_cursor: usize,
     /// Generation of the active account's scan; events from older epochs drop.
     epoch: u64,
+    /// Pending `g` for the `gg` (jump-to-top) chord.
+    pending_g: bool,
+    /// Active search/filter query (empty = no filter).
+    search: String,
+    /// True while typing a search query.
+    searching: bool,
     account: Option<Profile>,
     metas: Vec<MessageMeta>,
     attachment_ids: HashSet<String>,
@@ -334,7 +361,11 @@ impl App {
             accounts: Vec::new(),
             active: 0,
             account_cursor: 0,
+            config_cursor: 0,
             epoch: 0,
+            pending_g: false,
+            search: String::new(),
+            searching: false,
             account: None,
             metas: Vec::new(),
             attachment_ids: HashSet::new(),
@@ -383,19 +414,53 @@ impl App {
         self.status = HELP.to_string();
     }
 
-    /// Activated Enter in the Accounts panel: switch or add (Gmail/Outlook).
+    /// Enter in the Accounts panel switches to the highlighted account.
     fn account_enter(&self) -> KeyOutcome {
-        let n = self.accounts.len();
-        if self.account_cursor < n {
-            if self.account_cursor == self.active {
-                KeyOutcome::None
-            } else {
-                KeyOutcome::Switch(self.account_cursor)
-            }
-        } else if self.account_cursor == n {
-            KeyOutcome::AddAccount(accounts::Provider::Gmail)
+        if self.account_cursor < self.accounts.len() && self.account_cursor != self.active {
+            KeyOutcome::Switch(self.account_cursor)
         } else {
-            KeyOutcome::AddAccount(accounts::Provider::Outlook)
+            KeyOutcome::None
+        }
+    }
+
+    /// Enter in the Config panel: set a credential, or start adding an account.
+    fn config_enter(&mut self) -> KeyOutcome {
+        match self.config_cursor {
+            0 => {
+                self.modal = Some(Modal::credential(accounts::Provider::Gmail, false));
+                KeyOutcome::None
+            }
+            1 => {
+                self.modal = Some(Modal::credential(accounts::Provider::Outlook, false));
+                KeyOutcome::None
+            }
+            2 => KeyOutcome::AddAccount(accounts::Provider::Gmail),
+            3 => KeyOutcome::AddAccount(accounts::Provider::Outlook),
+            _ => KeyOutcome::None,
+        }
+    }
+
+    fn goto_top(&mut self) {
+        match self.focus {
+            Panel::Accounts => self.account_cursor = 0,
+            Panel::Config => self.config_cursor = 0,
+            Panel::Domains => {
+                self.selected = 0;
+                self.detail_scroll = 0;
+            }
+            Panel::Details => self.detail_scroll = 0,
+        }
+    }
+
+    fn goto_bottom(&mut self) {
+        match self.focus {
+            Panel::Accounts => self.account_cursor = self.accounts.len().saturating_sub(1),
+            Panel::Config => self.config_cursor = CONFIG_ITEMS - 1,
+            Panel::Domains => {
+                self.selected = self.rows().len().saturating_sub(1);
+                self.detail_scroll = 0;
+            }
+            Panel::Details => {}
         }
     }
 
@@ -544,6 +609,9 @@ impl App {
         let mut groups = group_messages(&self.filtered_metas());
         let size_of = |m: &MessageMeta| self.msg_size(m);
         apply_sort(&mut groups, self.sort, &size_of);
+        if !self.search.is_empty() {
+            groups = filter_by_search(groups, &self.search);
+        }
         self.groups = groups;
         match anchor.and_then(|key| self.find_row(&key)) {
             Some(pos) => self.selected = pos,
@@ -597,9 +665,13 @@ impl App {
         match self.focus {
             Panel::Details => self.detail_scroll = self.detail_scroll.saturating_add(1),
             Panel::Accounts => {
-                // Rows: accounts, then "+ Add Gmail" and "+ Add Outlook".
-                if self.account_cursor < self.accounts.len() + 1 {
+                if self.account_cursor + 1 < self.accounts.len() {
                     self.account_cursor += 1;
+                }
+            }
+            Panel::Config => {
+                if self.config_cursor + 1 < CONFIG_ITEMS {
+                    self.config_cursor += 1;
                 }
             }
             Panel::Domains => {
@@ -609,7 +681,6 @@ impl App {
                     self.detail_scroll = 0;
                 }
             }
-            Panel::Config => {}
         }
     }
 
@@ -617,11 +688,11 @@ impl App {
         match self.focus {
             Panel::Details => self.detail_scroll = self.detail_scroll.saturating_sub(1),
             Panel::Accounts => self.account_cursor = self.account_cursor.saturating_sub(1),
+            Panel::Config => self.config_cursor = self.config_cursor.saturating_sub(1),
             Panel::Domains => {
                 self.selected = self.selected.saturating_sub(1);
                 self.detail_scroll = 0;
             }
-            Panel::Config => {}
         }
     }
 
@@ -1312,6 +1383,10 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
                 }
                 _ => Act::None,
             },
+            ModalState::Help => match code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => Act::Close,
+                _ => Act::None,
+            },
         }
     };
 
@@ -1338,32 +1413,52 @@ async fn handle_key(
     if app.modal.is_some() {
         return modal_key(app, code);
     }
-    // Config panel: set provider credentials.
-    if app.focus == Panel::Config {
+    if app.searching {
         match code {
-            KeyCode::Char('g') => {
-                app.modal = Some(Modal::credential(accounts::Provider::Gmail, false));
-                return KeyOutcome::None;
+            KeyCode::Enter => app.searching = false,
+            KeyCode::Esc => {
+                app.searching = false;
+                app.search.clear();
+                app.rebuild_groups();
             }
-            KeyCode::Char('o') => {
-                app.modal = Some(Modal::credential(accounts::Provider::Outlook, false));
-                return KeyOutcome::None;
+            KeyCode::Backspace => {
+                app.search.pop();
+                app.rebuild_groups();
+            }
+            KeyCode::Char(c) => {
+                app.search.push(c);
+                app.rebuild_groups();
             }
             _ => {}
         }
+        return KeyOutcome::None;
     }
+
+    // `gg` chord: remember a pending `g`, cleared by any other key.
+    let was_pending_g = app.pending_g;
+    app.pending_g = false;
+
     match code {
         KeyCode::Char('q') | KeyCode::Esc => return KeyOutcome::Quit,
         KeyCode::Char('1') => app.focus = Panel::Accounts,
         KeyCode::Char('2') => app.focus = Panel::Config,
         KeyCode::Char('3') => app.focus = Panel::Domains,
         KeyCode::Char('4') => app.focus = Panel::Details,
+        KeyCode::Char('/') => app.searching = true,
         KeyCode::Tab => app.set_view(app.view.next()),
         KeyCode::BackTab => app.set_view(app.view.prev()),
         KeyCode::Char('l') | KeyCode::Right => app.expand(),
         KeyCode::Char('h') | KeyCode::Left => app.collapse(),
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::Char('g') => {
+            if was_pending_g {
+                app.goto_top();
+            } else {
+                app.pending_g = true;
+            }
+        }
+        KeyCode::Char('G') => app.goto_bottom(),
         KeyCode::Char(' ') => app.toggle_mark(),
         KeyCode::Char('o') => {
             app.sort = app.sort.next();
@@ -1374,15 +1469,16 @@ async fn handle_key(
             app.marked.clear();
             app.status = "Cleared all selections".to_string();
         }
-        KeyCode::Char('?') => app.modal = Some(Modal::message(HELP_FULL.to_string())),
-        KeyCode::Enter => {
-            if app.focus == Panel::Accounts {
-                return app.account_enter();
+        KeyCode::Char('?') => app.modal = Some(Modal::help()),
+        KeyCode::Enter => match app.focus {
+            Panel::Accounts => return app.account_enter(),
+            Panel::Config => return app.config_enter(),
+            _ => {
+                if let Some(id) = app.selected_message_id() {
+                    open_message(app, provider, em, id);
+                }
             }
-            if let Some(id) = app.selected_message_id() {
-                open_message(app, provider, em, id);
-            }
-        }
+        },
         KeyCode::Char('a') => archive(app, provider, em, false),
         KeyCode::Char('A') => archive(app, provider, em, true),
         KeyCode::Char('d') => act(app, provider.as_ref(), Action::Trash).await,
@@ -1536,10 +1632,11 @@ async fn unsubscribe(app: &App, provider: &dyn MailProvider) -> String {
 // ---- rendering --------------------------------------------------------------
 
 fn ui(f: &mut Frame, app: &App) {
-    // Accounts panel: borders (2) + account rows + 2 add rows + sync line.
-    let accounts_height = (app.accounts.len() as u16 + 5).clamp(6, 14);
+    // Top row sized for accounts + sync line, or the 4 Config rows — whichever
+    // is taller (both inside a 2-line border).
+    let top_height = ((app.accounts.len() as u16 + 3).max(CONFIG_ITEMS as u16 + 2)).min(14);
     let rows = Layout::vertical([
-        Constraint::Length(accounts_height),
+        Constraint::Length(top_height),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
@@ -1555,7 +1652,19 @@ fn ui(f: &mut Frame, app: &App) {
     render_domains(f, app, body[0]);
     render_details(f, app, body[1]);
 
-    f.render_widget(Paragraph::new(app.status.clone()), rows[2]);
+    let status = if app.searching {
+        Line::from(vec![
+            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::raw(app.search.clone()),
+            Span::styled(
+                "  (Enter keep · Esc clear)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        Line::from(app.status.clone())
+    };
+    f.render_widget(Paragraph::new(status), rows[2]);
 
     if let Some(modal) = &app.modal {
         render_modal(f, modal);
@@ -1563,20 +1672,35 @@ fn ui(f: &mut Frame, app: &App) {
 }
 
 fn render_config(f: &mut Frame, app: &App, area: Rect) {
-    let mark = |ok: bool| if ok { "✓" } else { "✗" };
-    let lines = vec![
-        Line::from(format!("Gmail client secret  {}", mark(config::gmail_configured()))),
-        Line::from(format!("Outlook app id       {}", mark(config::outlook_configured()))),
-        Line::from(""),
-        Line::from(Span::styled(
-            "g set Gmail · o set Outlook",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    f.render_widget(
-        Paragraph::new(lines).block(panel_block(app, Panel::Config, "[2] Config")),
-        area,
-    );
+    let block = panel_block(app, Panel::Config, "[2] Config");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let status = |ok: bool| if ok { " [✓]" } else { " [✗ not set]" };
+    let items: Vec<ListItem> = CONFIG_LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let suffix = match i {
+                0 => status(config::gmail_configured()).to_string(),
+                1 => status(config::outlook_configured()).to_string(),
+                _ => String::new(),
+            };
+            let style = if i >= 2 {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(format!("{label}{suffix}"), style)))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    if app.focus == Panel::Config {
+        state.select(Some(app.config_cursor.min(CONFIG_ITEMS - 1)));
+    }
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, inner, &mut state);
 }
 
 /// A centered rectangle `px`%×`py`% of `r`.
@@ -1620,11 +1744,42 @@ fn render_modal(f: &mut Frame, modal: &Modal) {
         return;
     }
 
+    // The key reference is a fixed two-column table.
+    if let ModalState::Help = &modal.state {
+        let area = centered_rect(56, 90, f.area());
+        f.render_widget(Clear, area);
+        let mut lines: Vec<Line> = HELP_KEYS
+            .iter()
+            .map(|(k, d)| {
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {k:<11} "),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(*d),
+                ])
+            })
+            .collect();
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Esc to close",
+            Style::default().fg(Color::DarkGray),
+        )));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title("Keys");
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
     let area = centered_rect(64, 50, f.area());
     f.render_widget(Clear, area);
 
     let (title, lines): (&str, Vec<Line>) = match &modal.state {
-        ModalState::MessageView { .. } => unreachable!("handled above"),
+        ModalState::MessageView { .. } | ModalState::Help => unreachable!("handled above"),
         ModalState::Credential {
             provider,
             input,
@@ -1720,8 +1875,8 @@ fn render_accounts(f: &mut Frame, app: &App, area: Rect) {
 
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
 
-    // One row per account, plus a "+ Add account" row.
-    let mut items: Vec<ListItem> = app
+    // One row per configured account.
+    let items: Vec<ListItem> = app
         .accounts
         .iter()
         .enumerate()
@@ -1743,17 +1898,9 @@ fn render_accounts(f: &mut Frame, app: &App, area: Rect) {
             )))
         })
         .collect();
-    items.push(ListItem::new(Line::from(Span::styled(
-        "[+ Add Gmail account]",
-        Style::default().fg(Color::Green),
-    ))));
-    items.push(ListItem::new(Line::from(Span::styled(
-        "[+ Add Outlook account]",
-        Style::default().fg(Color::Green),
-    ))));
 
     let mut state = ListState::default();
-    if app.focus == Panel::Accounts {
+    if app.focus == Panel::Accounts && !items.is_empty() {
         state.select(Some(app.account_cursor.min(items.len() - 1)));
     }
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -1792,11 +1939,17 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
     } else {
         format!(" · {} marked", app.marked.len())
     };
+    let search = if app.search.is_empty() {
+        String::new()
+    } else {
+        format!(" · /{}", app.search)
+    };
     let title = format!(
-        "[3] Domains ({}{}) · sort {}",
+        "[3] Domains ({}{}) · sort {}{}",
         app.groups.len(),
         marked,
-        app.sort.label()
+        app.sort.label(),
+        search
     );
     let block = panel_block(app, Panel::Domains, title);
     let inner = block.inner(area);
@@ -2007,6 +2160,28 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
             lines
         }
     }
+}
+
+/// Keep domains/senders that fuzzy-match `query` (a domain match keeps all its
+/// senders; otherwise only matching senders are kept).
+fn filter_by_search(groups: Vec<DomainGroup>, query: &str) -> Vec<DomainGroup> {
+    let matcher = SkimMatcherV2::default();
+    let hit = |hay: &str| matcher.fuzzy_match(hay, query).is_some();
+    groups
+        .into_iter()
+        .filter_map(|mut g| {
+            if hit(&g.domain) {
+                return Some(g);
+            }
+            g.senders
+                .retain(|s| hit(&s.email) || s.name.as_deref().map_or(false, |n| hit(n)));
+            if g.senders.is_empty() {
+                None
+            } else {
+                Some(g)
+            }
+        })
+        .collect()
 }
 
 /// Sort a tree of domains/senders/messages in place by the chosen mode.

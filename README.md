@@ -79,10 +79,12 @@ First launch opens a browser for consent; the token is cached to
 
 ### Keys (TUI)
 
-- `1`/`2`/`3` — focus the Accounts / Domains / Details panel; in the Accounts
-  panel, `j`/`k` move and `Enter` switches account (or `[+ Add account]`)
+- `1`/`2`/`3`/`4` — focus the Accounts / Config / Domains / Details panel.
+  Accounts: `j`/`k` + `Enter` switches account. Config: credential status +
+  `Enter` to set a credential or add an account.
 - `Tab` / `Shift-Tab` — switch domain view (All / Subscriptions / Attachments)
 - `o` — cycle sort (Messages / Size / Recent), applied to the current view
+- `/` — fuzzy search/filter the list; `gg`/`G` — jump to top/bottom
 - `j`/`k` (or `↑`/`↓`) — move within the focused panel (or scroll Details)
 - `h`/`l` (or `←`/`→`) — collapse / expand the tree (domain → sender → message)
 - `Space` — mark/unmark the selected node; `c` — clear all marks

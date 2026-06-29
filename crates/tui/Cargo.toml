@@ -15,3 +15,4 @@ tokio.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 chrono.workspace = true
+fuzzy-matcher.workspace = true
