@@ -87,10 +87,10 @@ First launch opens a browser for consent; the token is cached to
 - `h`/`l` (or `←`/`→`) — collapse / expand the tree (domain → sender → message)
 - `Space` — mark/unmark the selected node; `c` — clear all marks
 - `Enter` — load the selected message's attachment list into Details
-- `a` — archive attachments of the marked set (or the selected node)
+- `a` — archive the marked set (or selected node) as `.eml` + attachments
 - `A` — archive **and** trash those messages
 - `d` trash · `s` mark spam · `u` unsubscribe — acts on the marked set, or the selected node
-- `q` — quit
+- `?` — full key help · `q` — quit
 
 Views: **All** (everything), **Subscriptions** (senders with an unsubscribe
 header), **Attachments** (`has:attachment`). Sort each by message count, total
@@ -105,12 +105,16 @@ becomes instant) without per-message requests.
 The inbox syncs in the background: the domain → sender → message tree fills in as
 messages arrive, with a progress bar until the scan completes.
 
-### Attachment archives
+### Archives
 
-Pressing `a` downloads the attachments under the current selection and writes a
-zip to `~/.config/mailsweep/archives/<account>-<timestamp>.zip`, organized as
-`<domain>/<sender>/<message-id>__<filename>`, alongside a `manifest.json`
-describing every archived message and attachment.
+Pressing `a` downloads the selected messages and writes a zip to
+`~/.local/share/mailsweep/archives/<account>-<timestamp>.zip`, organized as
+`<domain>/<sender>/<message-id>.eml` (the full RFC 822 message, attachments
+included) plus extracted `<message-id>__<filename>` attachment files, alongside
+a `manifest.json`. `.eml` opens in Thunderbird / Apple Mail / Outlook.
+
+Only one instance runs at a time (a lock file under the data dir guards the
+shared caches/DBs).
 
 ## Performance
 

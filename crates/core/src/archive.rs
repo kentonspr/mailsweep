@@ -1,9 +1,10 @@
-//! Download attachments and pack them into a navigable zip archive.
+//! Download messages and attachments and pack them into a navigable zip.
 //!
 //! Layout inside the zip:
 //! ```text
-//! <domain>/<sender>/<message-id>__<filename>
-//! manifest.json   # metadata for every archived message + attachment
+//! <domain>/<sender>/<message-id>.eml          # full RFC 822 message
+//! <domain>/<sender>/<message-id>__<filename>  # extracted attachment
+//! manifest.json                               # metadata for every message
 //! ```
 
 use std::collections::HashSet;
@@ -37,6 +38,15 @@ pub struct ArchiveSummary {
     pub bytes: u64,
 }
 
+/// What to pull down when archiving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveScope {
+    /// Just the attachment files.
+    AttachmentsOnly,
+    /// The full `.eml` message plus its extracted attachments.
+    MessagesAndAttachments,
+}
+
 #[derive(Serialize)]
 struct ManifestEntry {
     domain: String,
@@ -54,14 +64,16 @@ struct ManifestAttachment {
     size: u64,
 }
 
-/// Fetch and zip the attachments for `items`, writing to `out_path`.
+/// Fetch and zip `items` to `out_path` per `scope`.
 ///
-/// Messages without attachments are skipped; individual download failures are
-/// skipped rather than aborting the whole archive.
-pub async fn archive_attachments(
+/// With `MessagesAndAttachments` every message is saved as a `.eml`; with
+/// `AttachmentsOnly` messages without attachments are skipped. Individual
+/// download failures are skipped rather than aborting the whole archive.
+pub async fn archive_messages(
     provider: &dyn MailProvider,
     items: &[ArchiveItem],
     out_path: &Path,
+    scope: ArchiveScope,
 ) -> Result<ArchiveSummary> {
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -77,16 +89,34 @@ pub async fn archive_attachments(
     let mut bytes = 0u64;
     let mut messages = 0;
 
+    let want_message = scope == ArchiveScope::MessagesAndAttachments;
+
     for item in items {
         let attachments = provider
             .message_attachments(&item.message_id)
             .await
             .unwrap_or_default();
-        if attachments.is_empty() {
+        if !want_message && attachments.is_empty() {
             continue;
         }
         messages += 1;
+        let dir = format!("{}/{}", sanitize(&item.domain), sanitize(&item.sender));
 
+        // The full message as .eml.
+        if want_message {
+            if let Ok(eml) = provider.download_raw_message(&item.message_id).await {
+                let mut name = format!("{dir}/{}.eml", item.message_id);
+                while !used_names.insert(name.clone()) {
+                    name.push('_');
+                }
+                zip.start_file(&name, options)?;
+                zip.write_all(&eml)?;
+                files += 1;
+                bytes += eml.len() as u64;
+            }
+        }
+
+        // Extracted attachments.
         let mut entry_attachments = Vec::new();
         for att in &attachments {
             let data = match provider
@@ -96,13 +126,10 @@ pub async fn archive_attachments(
                 Ok(d) => d,
                 Err(_) => continue,
             };
-
-            let dir = format!("{}/{}", sanitize(&item.domain), sanitize(&item.sender));
             let mut name = format!("{dir}/{}__{}", item.message_id, sanitize(&att.filename));
             while !used_names.insert(name.clone()) {
                 name.push('_');
             }
-
             zip.start_file(&name, options)?;
             zip.write_all(&data)?;
             files += 1;

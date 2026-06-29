@@ -33,13 +33,31 @@ use tokio::time::sleep;
 
 use mailsweep_core::outlook::{MsAuth, OutlookClient};
 use mailsweep_core::{
-    accounts, archive_attachments, config, group_messages, ArchiveItem, AttachmentInfo, AuthPrompt,
-    Cache, DomainGroup, FetchProgress, GmailAuth, GmailClient, MailProvider, MessageMeta, Profile,
-    SenderEntry, SyncResult, UnsubscribeInfo,
+    accounts, archive_messages, config, group_messages, ArchiveItem, ArchiveScope, AttachmentInfo,
+    AuthPrompt, Cache, DomainGroup, FetchProgress, GmailAuth, GmailClient, MailProvider,
+    MessageMeta, Profile, SenderEntry, SyncResult, UnsubscribeInfo,
 };
 
-const HELP: &str = "Tab view · o sort · j/k move · h/l fold · Space mark · c clear · \
-    Enter attach · a archive · A archive+del · d trash · s spam · u unsub · q quit";
+const HELP: &str =
+    "<Tab> view · o sort · j/k move · h/l fold · <Space> mark · ? help · q quit";
+
+const HELP_FULL: &str = "Keys\n\
+    \n\
+    <Tab> / <Shift-Tab>   Switch view (All / Subscriptions / Attachments)\n\
+    o                     Cycle sort (Messages / Size / Recent)\n\
+    j / k  (or arrows)    Move within the focused panel\n\
+    h / l  (or arrows)    Collapse / expand the tree\n\
+    <Space>               Marks / unmarks the selection\n\
+    c                     Clears all selections\n\
+    <Enter>               Loads attachments (Accounts panel: switch / add)\n\
+    a                     Archives the selection (.eml + attachments)\n\
+    A                     Archives and deletes the selection\n\
+    d                     Trashes the selection\n\
+    s                     Marks the selection as spam\n\
+    u                     Unsubscribes from the selection\n\
+    1 / 2 / 3 / 4         Focus Accounts / Config / Domains / Details\n\
+    ?                     Shows this help\n\
+    q                     Quits";
 
 /// Messages streamed from the background scan / archive tasks into the UI.
 enum ScanEvent {
@@ -687,7 +705,6 @@ impl App {
     /// Collect archivable messages (those with attachments) for the marked set,
     /// or — if nothing is marked — under the current selection.
     fn archive_items(&self) -> Vec<ArchiveItem> {
-        let has_attachment = |m: &MessageMeta| self.attachment_ids.contains(&m.id);
         let item = |g: &DomainGroup, s: &SenderEntry, m: &MessageMeta| ArchiveItem {
             message_id: m.id.clone(),
             domain: g.domain.clone(),
@@ -700,7 +717,7 @@ impl App {
             return self
                 .metas
                 .iter()
-                .filter(|m| self.marked.contains(&m.id) && has_attachment(m))
+                .filter(|m| self.marked.contains(&m.id))
                 .map(|m| ArchiveItem {
                     message_id: m.id.clone(),
                     domain: m.domain().to_string(),
@@ -715,20 +732,10 @@ impl App {
             Some(Row::Domain(g)) => g
                 .senders
                 .iter()
-                .flat_map(|s| {
-                    s.messages
-                        .iter()
-                        .filter(|m| has_attachment(m))
-                        .map(move |m| item(g, s, m))
-                })
+                .flat_map(|s| s.messages.iter().map(move |m| item(g, s, m)))
                 .collect(),
-            Some(Row::Sender(g, s)) => s
-                .messages
-                .iter()
-                .filter(|m| has_attachment(m))
-                .map(|m| item(g, s, m))
-                .collect(),
-            Some(Row::Message(g, s, m)) if has_attachment(m) => vec![item(g, s, m)],
+            Some(Row::Sender(g, s)) => s.messages.iter().map(|m| item(g, s, m)).collect(),
+            Some(Row::Message(g, s, m)) => vec![item(g, s, m)],
             _ => Vec::new(),
         }
     }
@@ -749,6 +756,8 @@ impl App {
 #[tokio::main]
 async fn main() -> Result<()> {
     config::migrate_to_data_dir();
+    // Refuse to start if another instance is live (shared caches/DBs).
+    let _lock = mailsweep_core::lock::InstanceLock::acquire()?;
     let _ = accounts::migrate_legacy_if_needed().await;
     let mut list = accounts::list_accounts();
     if list.is_empty() {
@@ -888,6 +897,14 @@ async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache) {
     }
 
     let limit = config::scan_limit();
+
+    // List attachment messages FIRST so the Attachments tab filters correctly
+    // as metadata streams in (rather than staying empty until the sync ends).
+    let attachment_ids = provider.list_attachment_ids(limit).await.unwrap_or_default();
+    em.send(ScanEvent::AttachmentIds(
+        attachment_ids.iter().cloned().collect(),
+    ));
+
     let token = cache.get_state("history_id").await.ok().flatten();
     em.send(ScanEvent::Status("Syncing inbox…".to_string()));
     let result = match provider.inbox_sync(token.as_deref(), limit).await {
@@ -905,12 +922,7 @@ async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache) {
     }
     let _ = cache.set_state("history_id", &result.next_token).await;
 
-    // Attachments view data + background actual sizes (shared by both paths).
-    let attachment_ids = provider.list_attachment_ids(limit).await.unwrap_or_default();
-    em.send(ScanEvent::AttachmentIds(
-        attachment_ids.iter().cloned().collect(),
-    ));
-
+    // Background: actual attachment filenames/sizes.
     let total = attachment_ids.len();
     for (i, id) in attachment_ids.into_iter().enumerate() {
         if let Ok(list) = provider.message_attachments(&id).await {
@@ -1250,8 +1262,9 @@ async fn handle_key(
         }
         KeyCode::Char('c') => {
             app.marked.clear();
-            app.status = "Cleared marks".to_string();
+            app.status = "Cleared all selections".to_string();
         }
+        KeyCode::Char('?') => app.modal = Some(Modal::message(HELP_FULL.to_string())),
         KeyCode::Enter => {
             if app.focus == Panel::Accounts {
                 return app.account_enter();
@@ -1286,7 +1299,7 @@ async fn load_attachments(app: &mut App, provider: &dyn MailProvider) {
 fn archive(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, delete_after: bool) {
     let items = app.archive_items();
     if items.is_empty() {
-        app.status = "No attachments to archive in selection".to_string();
+        app.status = "Nothing to archive in selection".to_string();
         return;
     }
     let account = app
@@ -1301,12 +1314,19 @@ fn archive(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, delete
     let path = config::archive_dir().join(format!("{account}-{ts}.zip"));
 
     let verb = if delete_after { "Archiving + deleting" } else { "Archiving" };
-    app.status = format!("{verb} attachments from {} message(s)…", items.len());
+    app.status = format!("{verb} {} message(s)…", items.len());
     let provider = provider.clone();
     let em = em.clone();
     tokio::spawn(async move {
         let ids: Vec<String> = items.iter().map(|i| i.message_id.clone()).collect();
-        let msg = match archive_attachments(provider.as_ref(), &items, &path).await {
+        let msg = match archive_messages(
+            provider.as_ref(),
+            &items,
+            &path,
+            ArchiveScope::MessagesAndAttachments,
+        )
+        .await
+        {
             Ok(s) if delete_after => match provider.trash(&ids).await {
                 Ok(()) => {
                     em.send(ScanEvent::Removed(ids.clone()));
@@ -1648,7 +1668,10 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(tabs_line(app.view)), chunks[0]);
 
     let header = Line::from(Span::styled(
-        format!("{:4}{:>7} {:>8}  {}", "", "Senders", "Messages", "Name"),
+        format!(
+            "{:4}{:>7} {:>8} {:>10}  {}",
+            "", "Senders", "Messages", "Size", "Name"
+        ),
         Style::default().add_modifier(Modifier::UNDERLINED),
     ));
     f.render_widget(Paragraph::new(header), chunks[1]);
@@ -1680,7 +1703,6 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn row_line(app: &App, row: &Row) -> Line<'static> {
-    let show_size = app.sort == SortMode::Size;
     match row {
         Row::Domain(g) => {
             let marker = if app.expanded_domains.contains(&g.domain) {
@@ -1690,15 +1712,11 @@ fn row_line(app: &App, row: &Row) -> Line<'static> {
             };
             let mark = app.mark_glyph(&g.message_ids());
             let unsub = if g.unsubscribe.is_some() { " ✉" } else { "" };
-            let size = if show_size {
-                format!("  ({})", human_bytes(app.domain_size(g)))
-            } else {
-                String::new()
-            };
             Line::from(format!(
-                "{mark}{marker}  {:>7} {:>8}  {}{unsub}{size}",
+                "{mark}{marker}  {:>7} {:>8} {:>10}  {}{unsub}",
                 g.sender_count(),
                 g.count(),
+                human_bytes(app.domain_size(g)),
                 g.domain
             ))
         }
@@ -1711,26 +1729,22 @@ fn row_line(app: &App, row: &Row) -> Line<'static> {
             let mark = app.mark_glyph(&s.message_ids());
             let unsub = if s.unsubscribe.is_some() { " ✉" } else { "" };
             let who = s.name.clone().unwrap_or_else(|| s.email.clone());
-            let size = if show_size {
-                format!("  ({})", human_bytes(app.sender_size(s)))
-            } else {
-                String::new()
-            };
             Line::from(format!(
-                "{mark} {marker} {:>7} {:>8}    {who} <{}>{unsub}{size}",
+                "{mark} {marker} {:>7} {:>8} {:>10}   {who} <{}>{unsub}",
                 "",
                 s.count(),
+                human_bytes(app.sender_size(s)),
                 s.email
             ))
         }
         Row::Message(_, _, m) => {
             let mark = app.mark_glyph(std::slice::from_ref(&m.id));
             Line::from(format!(
-                "{mark}   {:>7} {:>8}    {}  {:>8}  {}",
+                "{mark}   {:>7} {:>8} {:>10}   {}  {}",
                 "",
                 "",
-                fmt_date_short(m.internal_date),
                 human_bytes(app.msg_size(m)),
+                fmt_date_short(m.internal_date),
                 m.subject
             ))
         }

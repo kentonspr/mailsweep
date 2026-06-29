@@ -7,12 +7,13 @@ pub mod auth;
 pub mod cache;
 pub mod config;
 pub mod gmail;
+pub mod lock;
 pub mod model;
 pub mod outlook;
 pub mod provider;
 pub mod unsubscribe;
 
-pub use archive::{archive_attachments, ArchiveItem, ArchiveSummary};
+pub use archive::{archive_messages, ArchiveItem, ArchiveScope, ArchiveSummary};
 pub use auth::{AuthPrompt, GmailAuth};
 pub use cache::Cache;
 pub use gmail::{

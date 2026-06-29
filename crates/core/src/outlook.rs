@@ -542,6 +542,20 @@ impl MailProvider for OutlookClient {
             .await?;
         Ok(bytes.to_vec())
     }
+
+    async fn download_raw_message(&self, message_id: &str) -> Result<Vec<u8>> {
+        let bearer = self.bearer().await?;
+        let bytes = self
+            .http
+            .get(format!("{GRAPH}/me/messages/{message_id}/$value"))
+            .header("Authorization", &bearer)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        Ok(bytes.to_vec())
+    }
 }
 
 fn meta_from_graph(msg: GraphMessage) -> MessageMeta {

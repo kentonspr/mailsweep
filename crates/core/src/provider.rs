@@ -61,4 +61,7 @@ pub trait MailProvider: Send + Sync {
     /// Download one attachment's raw bytes.
     async fn download_attachment(&self, message_id: &str, attachment_id: &str)
         -> Result<Vec<u8>>;
+
+    /// Download the full raw RFC 822 message (`.eml`), including attachments.
+    async fn download_raw_message(&self, message_id: &str) -> Result<Vec<u8>>;
 }

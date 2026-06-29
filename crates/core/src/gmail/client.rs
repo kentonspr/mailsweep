@@ -543,6 +543,23 @@ impl MailProvider for GmailClient {
     ) -> Result<Vec<u8>> {
         GmailClient::download_attachment(self, message_id, attachment_id).await
     }
+
+    async fn download_raw_message(&self, message_id: &str) -> Result<Vec<u8>> {
+        let bearer = self.bearer().await?;
+        let resp: RawMessageResp = self
+            .http
+            .get(format!("{BASE}/messages/{message_id}"))
+            .header("Authorization", &bearer)
+            .query(&[("format", "raw")])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        base64_url()
+            .decode(resp.raw.as_bytes())
+            .map_err(|e| anyhow!("decoding raw message: {e}"))
+    }
 }
 
 /// Issue a single Gmail batch request for up to `BATCH_GET_LIMIT` messages.
@@ -790,6 +807,12 @@ struct PartBody {
 struct AttachmentResp {
     #[serde(default)]
     data: String,
+}
+
+#[derive(Deserialize)]
+struct RawMessageResp {
+    #[serde(default)]
+    raw: String,
 }
 
 #[cfg(test)]
