@@ -566,6 +566,12 @@ impl MailProvider for GmailClient {
         self.batch_modify(ids, &["INBOX"], &["TRASH", "SPAM"]).await
     }
 
+    async fn permanent_delete(&self, _ids: &[String]) -> Result<()> {
+        // batchDelete requires the full https://mail.google.com/ scope, which
+        // Mailsweep deliberately does not request (gmail.modify can't expunge).
+        anyhow::bail!("permanent delete needs full Gmail access, which Mailsweep doesn't request")
+    }
+
     async fn unsubscribe_one_click(&self, info: &UnsubscribeInfo) -> Result<bool> {
         GmailClient::unsubscribe_one_click(self, info).await
     }

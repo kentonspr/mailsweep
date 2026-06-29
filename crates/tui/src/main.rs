@@ -60,6 +60,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("d / s", "Trash / spam"),
     ("r", "Mark read"),
     ("u / U", "Unsubscribe / unsubscribe + delete"),
+    ("X", "Permanently delete (not on Gmail)"),
     ("z", "Undo last delete"),
     ("O", "Overview / stats"),
     ("?", "Show this help"),
@@ -1695,6 +1696,7 @@ async fn handle_key(
         KeyCode::Char('d') => act(app, provider, em, Action::Trash),
         KeyCode::Char('s') => act(app, provider, em, Action::Spam),
         KeyCode::Char('r') => act(app, provider, em, Action::Read),
+        KeyCode::Char('X') => act(app, provider, em, Action::PermanentDelete),
         KeyCode::Char('z') => undo_last(app, provider, em),
         KeyCode::Char('u') => unsubscribe(app, provider, em, false),
         KeyCode::Char('U') => unsubscribe(app, provider, em, true),
@@ -1814,6 +1816,7 @@ enum Action {
     Trash,
     Spam,
     Read,
+    PermanentDelete,
 }
 
 impl Action {
@@ -1822,6 +1825,7 @@ impl Action {
             Action::Trash => "Trashing",
             Action::Spam => "Marking as spam",
             Action::Read => "Marking read",
+            Action::PermanentDelete => "Permanently deleting",
         }
     }
     fn past(self) -> &'static str {
@@ -1829,6 +1833,7 @@ impl Action {
             Action::Trash => "Trashed",
             Action::Spam => "Marked as spam",
             Action::Read => "Marked read",
+            Action::PermanentDelete => "Permanently deleted",
         }
     }
     fn confirm_verb(self) -> &'static str {
@@ -1836,11 +1841,16 @@ impl Action {
             Action::Trash => "Trash",
             Action::Spam => "Mark as spam",
             Action::Read => "Mark read",
+            Action::PermanentDelete => "PERMANENTLY DELETE (irreversible)",
         }
     }
-    /// Whether the action removes messages from the inbox (and is undoable).
+    /// Whether the action removes messages from the inbox.
     fn removes(self) -> bool {
-        matches!(self, Action::Trash | Action::Spam)
+        matches!(self, Action::Trash | Action::Spam | Action::PermanentDelete)
+    }
+    /// Always confirm, regardless of count (irreversible).
+    fn always_confirm(self) -> bool {
+        matches!(self, Action::PermanentDelete)
     }
 }
 
@@ -1874,7 +1884,7 @@ fn act(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, action: Ac
     if ids.is_empty() {
         return;
     }
-    if action.removes() && ids.len() > CONFIRM_THRESHOLD {
+    if action.always_confirm() || (action.removes() && ids.len() > CONFIRM_THRESHOLD) {
         let prompt = format!(
             "{} {} message(s) from {label}?",
             action.confirm_verb(),
@@ -1905,6 +1915,7 @@ fn run_act(
             Action::Trash => provider.trash(&ids).await,
             Action::Spam => provider.mark_spam(&ids).await,
             Action::Read => provider.mark_read(&ids).await,
+            Action::PermanentDelete => provider.permanent_delete(&ids).await,
         };
         match result {
             Ok(()) => {
