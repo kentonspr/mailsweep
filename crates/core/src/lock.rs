@@ -1,46 +1,41 @@
 //! Single-instance lock, so two copies don't fight over the same caches/DBs.
+//!
+//! Uses an advisory file lock (cross-platform: Linux/macOS/Windows). The lock
+//! is released automatically when the process exits, even on a crash.
 
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 
 use crate::config;
 
-/// A held single-instance lock; removed on drop.
+/// A held single-instance lock; released when dropped (or on process exit).
 pub struct InstanceLock {
-    path: PathBuf,
+    _file: File,
+    _path: PathBuf,
 }
 
 impl InstanceLock {
     /// Acquire the lock, or fail if another live instance holds it.
     pub fn acquire() -> Result<Self> {
-        let path = config::data_dir().join("mailsweep.lock");
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Ok(pid) = contents.trim().parse::<i32>() {
-                if pid != std::process::id() as i32 && process_alive(pid) {
-                    bail!("another mailsweep instance is already running (pid {pid})");
-                }
-            }
+        let dir = config::data_dir();
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("mailsweep.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening lock file {}", path.display()))?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(InstanceLock {
+                _file: file,
+                _path: path,
+            }),
+            Err(_) => bail!("another mailsweep instance is already running"),
         }
-        std::fs::create_dir_all(config::data_dir()).ok();
-        std::fs::write(&path, std::process::id().to_string())?;
-        Ok(InstanceLock { path })
     }
-}
-
-impl Drop for InstanceLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-#[cfg(unix)]
-fn process_alive(pid: i32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
-}
-
-#[cfg(not(unix))]
-fn process_alive(_pid: i32) -> bool {
-    // Conservative: assume a recorded PID is still live on non-Linux.
-    true
 }
