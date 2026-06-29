@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/tui", "crates/gui"]
+members = ["crates/core", "crates/tui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,6 +26,5 @@ chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 ratatui = "0.29"
 crossterm = "0.28"
 fuzzy-matcher = "0.3"
-iced = { version = "0.13", features = ["tokio"] }
 
 mailsweep-core = { path = "crates/core" }

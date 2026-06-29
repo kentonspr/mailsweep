@@ -12,9 +12,8 @@ Each user runs it against their own account, so it stays within Gmail's OAuth
 
 ```
 crates/
-  core/   shared library: OAuth, Gmail client, grouping, unsubscribe
+  core/   shared library: providers (Gmail/Outlook), sync, cache, archive
   tui/    ratatui terminal frontend  (binary: mailsweep)
-  gui/    iced desktop frontend       (binary: mailsweep-gui)
 ```
 
 ## Multiple accounts & providers
@@ -67,15 +66,11 @@ but **cannot permanently delete** (deletions go to Trash and are reversible).
 ## Run
 
 ```sh
-# Terminal UI
 cargo run -p mailsweep-tui
-
-# Desktop GUI
-cargo run -p mailsweep-gui
 ```
 
-First launch opens a browser for consent; the token is cached to
-`~/.config/mailsweep/token_cache.json` for subsequent runs.
+First launch opens a browser (Gmail) or shows a device code (Outlook) for
+consent; tokens are cached per account under `~/.local/share/mailsweep/`.
 
 ### Keys (TUI)
 
