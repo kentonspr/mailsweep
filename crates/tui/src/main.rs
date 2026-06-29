@@ -174,8 +174,8 @@ enum ModalState {
     Help,
     /// Yes/no confirmation for a destructive action.
     Confirm(String),
-    /// Entering a server-side scan query.
-    QueryInput { input: String },
+    /// Entering a server-side scan query (`help` describes the provider syntax).
+    QueryInput { input: String, help: String },
 }
 
 impl Modal {
@@ -237,9 +237,12 @@ impl Modal {
         }
     }
 
-    fn query_input(prefill: String) -> Self {
+    fn query_input(prefill: String, help: String) -> Self {
         Modal {
-            state: ModalState::QueryInput { input: prefill },
+            state: ModalState::QueryInput {
+                input: prefill,
+                help,
+            },
         }
     }
 }
@@ -1509,7 +1512,7 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
                 KeyCode::Char('n') | KeyCode::Esc => Act::Close,
                 _ => Act::None,
             },
-            ModalState::QueryInput { input } => match code {
+            ModalState::QueryInput { input, .. } => match code {
                 KeyCode::Esc => Act::Close,
                 KeyCode::Enter => {
                     let q = input.trim();
@@ -1596,7 +1599,10 @@ async fn handle_key(
         KeyCode::Char('4') => app.focus = Panel::Details,
         KeyCode::Char('/') => app.searching = true,
         KeyCode::Char('f') => {
-            app.modal = Some(Modal::query_input(app.scope_query.clone().unwrap_or_default()));
+            app.modal = Some(Modal::query_input(
+                app.scope_query.clone().unwrap_or_default(),
+                provider.query_help().to_string(),
+            ));
         }
         KeyCode::Tab => app.set_view(app.view.next()),
         KeyCode::BackTab => app.set_view(app.view.prev()),
@@ -2242,10 +2248,10 @@ fn render_modal(f: &mut Frame, modal: &Modal) {
                 )),
             ],
         ),
-        ModalState::QueryInput { input } => (
+        ModalState::QueryInput { input, help } => (
             "Scan scope",
             vec![
-                Line::from("Scan query (Gmail search syntax; empty = inbox):"),
+                Line::from("Scan query (empty = inbox):"),
                 Line::from(""),
                 Line::from(Span::styled(
                     format!("> {input}"),
@@ -2253,7 +2259,7 @@ fn render_modal(f: &mut Frame, modal: &Modal) {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "e.g.  older_than:1y   larger:5M   is:unread   category:promotions",
+                    help.clone(),
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(""),

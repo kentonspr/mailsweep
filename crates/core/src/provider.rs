@@ -43,6 +43,9 @@ pub trait MailProvider: Send + Sync {
     /// Outlook treats it as a `$search` text query).
     async fn list_query_ids(&self, query: &str, max: usize) -> Result<Vec<String>>;
 
+    /// A one-line hint describing this provider's scan-query syntax/examples.
+    fn query_help(&self) -> &'static str;
+
     /// Fetch header metadata for `ids`, reporting progress via `on_update`.
     async fn fetch_metadata(
         &self,

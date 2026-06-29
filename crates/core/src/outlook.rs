@@ -384,6 +384,10 @@ impl MailProvider for OutlookClient {
         .await
     }
 
+    fn query_help(&self) -> &'static str {
+        "Outlook search (KQL) · from:amazon · subject:invoice · hasAttachments:true"
+    }
+
     async fn fetch_metadata(
         &self,
         ids: &[String],

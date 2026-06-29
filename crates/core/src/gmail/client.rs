@@ -517,6 +517,10 @@ impl MailProvider for GmailClient {
         self.list_message_ids(Some(query), max).await
     }
 
+    fn query_help(&self) -> &'static str {
+        "Gmail search · older_than:1y · larger:5M · is:unread · category:promotions"
+    }
+
     async fn fetch_metadata(
         &self,
         ids: &[String],
