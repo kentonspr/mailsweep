@@ -521,6 +521,20 @@ impl MailProvider for GmailClient {
         "Gmail search · older_than:1y · larger:5M · is:unread · category:promotions"
     }
 
+    fn query_examples(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("Older than 1 year", "older_than:1y"),
+            ("Larger than 5 MB", "larger:5M"),
+            ("Unread", "is:unread"),
+            ("Promotions tab", "category:promotions"),
+            ("Social tab", "category:social"),
+            ("Has an attachment", "has:attachment"),
+            ("Before a date", "before:2023/01/01"),
+            ("From a sender", "from:newsletter@example.com"),
+            ("All mail (not just inbox)", "in:anywhere"),
+        ]
+    }
+
     async fn fetch_metadata(
         &self,
         ids: &[String],

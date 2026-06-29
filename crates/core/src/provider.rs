@@ -46,6 +46,9 @@ pub trait MailProvider: Send + Sync {
     /// A one-line hint describing this provider's scan-query syntax/examples.
     fn query_help(&self) -> &'static str;
 
+    /// Longer `(description, query)` examples for this provider's scan queries.
+    fn query_examples(&self) -> &'static [(&'static str, &'static str)];
+
     /// Fetch header metadata for `ids`, reporting progress via `on_update`.
     async fn fetch_metadata(
         &self,

@@ -388,6 +388,17 @@ impl MailProvider for OutlookClient {
         "Outlook search (KQL) · from:amazon · subject:invoice · hasAttachments:true"
     }
 
+    fn query_examples(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("From a sender", "from:amazon"),
+            ("Subject contains", "subject:invoice"),
+            ("Has an attachment", "hasAttachments:true"),
+            ("Received before a date", "received<=2023-01-01"),
+            ("Unread", "isRead:false"),
+            ("Keyword anywhere", "newsletter"),
+        ]
+    }
+
     async fn fetch_metadata(
         &self,
         ids: &[String],

@@ -49,7 +49,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("Tab / S-Tab", "Switch view (All / Subscriptions / Attachments)"),
     ("o", "Cycle sort (Messages / Size / Recent)"),
     ("/", "Search / filter the loaded list"),
-    ("f", "Scan scope / query (server-side)"),
+    ("f", "Scan scope / query (Tab for examples)"),
     ("j / k", "Move down / up"),
     ("g g / G", "Jump to top / bottom"),
     ("h / l", "Collapse / expand the tree"),
@@ -174,8 +174,14 @@ enum ModalState {
     Help,
     /// Yes/no confirmation for a destructive action.
     Confirm(String),
-    /// Entering a server-side scan query (`help` describes the provider syntax).
-    QueryInput { input: String, help: String },
+    /// Entering a server-side scan query (`help` describes the provider syntax;
+    /// `examples` is shown when `expanded`).
+    QueryInput {
+        input: String,
+        help: String,
+        examples: Vec<(String, String)>,
+        expanded: bool,
+    },
 }
 
 impl Modal {
@@ -237,11 +243,13 @@ impl Modal {
         }
     }
 
-    fn query_input(prefill: String, help: String) -> Self {
+    fn query_input(prefill: String, help: String, examples: Vec<(String, String)>) -> Self {
         Modal {
             state: ModalState::QueryInput {
                 input: prefill,
                 help,
+                examples,
+                expanded: false,
             },
         }
     }
@@ -1512,8 +1520,14 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
                 KeyCode::Char('n') | KeyCode::Esc => Act::Close,
                 _ => Act::None,
             },
-            ModalState::QueryInput { input, .. } => match code {
+            ModalState::QueryInput {
+                input, expanded, ..
+            } => match code {
                 KeyCode::Esc => Act::Close,
+                KeyCode::Tab => {
+                    *expanded = !*expanded;
+                    Act::None
+                }
                 KeyCode::Enter => {
                     let q = input.trim();
                     let scope = if q.is_empty() || q == "in:inbox" {
@@ -1599,9 +1613,15 @@ async fn handle_key(
         KeyCode::Char('4') => app.focus = Panel::Details,
         KeyCode::Char('/') => app.searching = true,
         KeyCode::Char('f') => {
+            let examples = provider
+                .query_examples()
+                .iter()
+                .map(|(d, q)| (d.to_string(), q.to_string()))
+                .collect();
             app.modal = Some(Modal::query_input(
                 app.scope_query.clone().unwrap_or_default(),
                 provider.query_help().to_string(),
+                examples,
             ));
         }
         KeyCode::Tab => app.set_view(app.view.next()),
@@ -2168,11 +2188,66 @@ fn render_modal(f: &mut Frame, modal: &Modal) {
         return;
     }
 
+    // Scan-query input — grows when examples are expanded.
+    if let ModalState::QueryInput {
+        input,
+        help,
+        examples,
+        expanded,
+    } = &modal.state
+    {
+        let area = centered_rect(66, if *expanded { 82 } else { 46 }, f.area());
+        f.render_widget(Clear, area);
+        let mut lines = vec![
+            Line::from("Scan query (empty = inbox):"),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("> {input}"),
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(""),
+        ];
+        if *expanded {
+            lines.push(Line::from(Span::styled(
+                "Examples:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )));
+            for (desc, q) in examples {
+                lines.push(Line::from(vec![
+                    Span::raw(format!("  {desc:<26}")),
+                    Span::styled(q.clone(), Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                help.clone(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            if *expanded {
+                "Enter to scan · Tab to collapse · Esc to cancel"
+            } else {
+                "Enter to scan · Tab for examples · Esc to cancel"
+            },
+            Style::default().fg(Color::DarkGray),
+        )));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title("Scan scope");
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
     let area = centered_rect(64, 50, f.area());
     f.render_widget(Clear, area);
 
     let (title, lines): (&str, Vec<Line>) = match &modal.state {
-        ModalState::MessageView { .. } | ModalState::Help => unreachable!("handled above"),
+        ModalState::MessageView { .. } | ModalState::Help | ModalState::QueryInput { .. } => {
+            unreachable!("handled above")
+        }
         ModalState::Credential {
             provider,
             input,
@@ -2244,27 +2319,6 @@ fn render_modal(f: &mut Frame, modal: &Modal) {
                 Line::from(""),
                 Line::from(Span::styled(
                     "(y) yes    (n) no",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ],
-        ),
-        ModalState::QueryInput { input, help } => (
-            "Scan scope",
-            vec![
-                Line::from("Scan query (empty = inbox):"),
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("> {input}"),
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    help.clone(),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Enter to scan · Esc to cancel",
                     Style::default().fg(Color::DarkGray),
                 )),
             ],
