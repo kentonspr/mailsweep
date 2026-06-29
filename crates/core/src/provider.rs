@@ -39,6 +39,10 @@ pub trait MailProvider: Send + Sync {
     /// Message IDs in the inbox that carry attachments.
     async fn list_attachment_ids(&self, max: usize) -> Result<Vec<String>>;
 
+    /// Message IDs matching a free-form provider query (Gmail search syntax;
+    /// Outlook treats it as a `$search` text query).
+    async fn list_query_ids(&self, query: &str, max: usize) -> Result<Vec<String>>;
+
     /// Fetch header metadata for `ids`, reporting progress via `on_update`.
     async fn fetch_metadata(
         &self,

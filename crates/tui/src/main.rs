@@ -48,7 +48,8 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("1 2 3 4", "Focus Accounts / Config / Domains / Details"),
     ("Tab / S-Tab", "Switch view (All / Subscriptions / Attachments)"),
     ("o", "Cycle sort (Messages / Size / Recent)"),
-    ("/", "Search / filter the list"),
+    ("/", "Search / filter the loaded list"),
+    ("f", "Scan scope / query (server-side)"),
     ("j / k", "Move down / up"),
     ("g g / G", "Jump to top / bottom"),
     ("h / l", "Collapse / expand the tree"),
@@ -131,6 +132,7 @@ enum KeyOutcome {
     AddAccount(accounts::Provider),
     StartAuth(accounts::Provider),
     ConfirmRun,
+    Rescan,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -172,6 +174,8 @@ enum ModalState {
     Help,
     /// Yes/no confirmation for a destructive action.
     Confirm(String),
+    /// Entering a server-side scan query.
+    QueryInput { input: String },
 }
 
 impl Modal {
@@ -230,6 +234,12 @@ impl Modal {
     fn confirm(prompt: String) -> Self {
         Modal {
             state: ModalState::Confirm(prompt),
+        }
+    }
+
+    fn query_input(prefill: String) -> Self {
+        Modal {
+            state: ModalState::QueryInput { input: prefill },
         }
     }
 }
@@ -343,6 +353,8 @@ struct App {
     search: String,
     /// True while typing a search query.
     searching: bool,
+    /// Server-side scan scope (None = inbox; Some = a provider query).
+    scope_query: Option<String>,
     account: Option<Profile>,
     metas: Vec<MessageMeta>,
     attachment_ids: HashSet<String>,
@@ -389,6 +401,7 @@ impl App {
             pending_g: false,
             search: String::new(),
             searching: false,
+            scope_query: None,
             account: None,
             metas: Vec::new(),
             attachment_ids: HashSet::new(),
@@ -1011,14 +1024,19 @@ fn build_account(account: &accounts::Account) -> Result<AccountCtx> {
     })
 }
 
-fn spawn_scan(epoch: u64, ctx: &AccountCtx, tx: &UnboundedSender<(u64, ScanEvent)>) -> JoinHandle<()> {
+fn spawn_scan(
+    epoch: u64,
+    ctx: &AccountCtx,
+    query: Option<String>,
+    tx: &UnboundedSender<(u64, ScanEvent)>,
+) -> JoinHandle<()> {
     let em = Emitter {
         tx: tx.clone(),
         epoch,
     };
     let provider = ctx.provider.clone();
     let cache = ctx.cache.clone();
-    tokio::spawn(async move { run_scan(em, provider, cache).await })
+    tokio::spawn(async move { run_scan(em, provider, cache, query).await })
 }
 
 async fn run_app(list: Vec<accounts::Account>) -> Result<()> {
@@ -1047,7 +1065,7 @@ async fn run_app(list: Vec<accounts::Account>) -> Result<()> {
 
     let mut epoch = 1u64;
     app.epoch = epoch;
-    let mut handle = spawn_scan(epoch, &accounts_ctx[0], &tx);
+    let mut handle = spawn_scan(epoch, &accounts_ctx[0], None, &tx);
 
     let result = event_loop(
         &mut terminal,
@@ -1067,6 +1085,22 @@ async fn run_app(list: Vec<accounts::Account>) -> Result<()> {
     result
 }
 
+/// Abort the current scan and start a fresh one for the active account and the
+/// current scope query.
+fn restart_scan(
+    accounts_ctx: &[AccountCtx],
+    app: &mut App,
+    epoch: &mut u64,
+    handle: &mut JoinHandle<()>,
+    tx: &UnboundedSender<(u64, ScanEvent)>,
+) {
+    handle.abort();
+    *epoch += 1;
+    app.reset_for_account();
+    app.epoch = *epoch;
+    *handle = spawn_scan(*epoch, &accounts_ctx[app.active], app.scope_query.clone(), tx);
+}
+
 fn switch_account(
     i: usize,
     accounts_ctx: &[AccountCtx],
@@ -1078,16 +1112,12 @@ fn switch_account(
     if i >= accounts_ctx.len() {
         return;
     }
-    handle.abort();
-    *epoch += 1;
-    app.reset_for_account();
     app.active = i;
     app.account_cursor = i;
-    app.epoch = *epoch;
-    *handle = spawn_scan(*epoch, &accounts_ctx[i], tx);
+    restart_scan(accounts_ctx, app, epoch, handle, tx);
 }
 
-async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache) {
+async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache, query: Option<String>) {
     em.send(ScanEvent::Status("Authenticating…".to_string()));
     match provider.profile().await {
         Ok(p) => em.send(ScanEvent::Account(p)),
@@ -1099,29 +1129,48 @@ async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache) {
 
     let limit = config::scan_limit();
 
-    // List attachment messages FIRST so the Attachments tab filters correctly
-    // as metadata streams in (rather than staying empty until the sync ends).
-    let attachment_ids = provider.list_attachment_ids(limit).await.unwrap_or_default();
+    // Attachment IDs first so the Attachments tab filters correctly as metadata
+    // streams in (scoped to the query when one is set).
+    let attachment_ids = match &query {
+        None => provider.list_attachment_ids(limit).await,
+        Some(q) => provider.list_query_ids(&format!("{q} has:attachment"), limit).await,
+    }
+    .unwrap_or_default();
     em.send(ScanEvent::AttachmentIds(
         attachment_ids.iter().cloned().collect(),
     ));
 
-    let token = cache.get_state("history_id").await.ok().flatten();
-    em.send(ScanEvent::Status("Syncing inbox…".to_string()));
-    let result = match provider.inbox_sync(token.as_deref(), limit).await {
-        Ok(r) => r,
-        Err(e) => {
-            em.send(ScanEvent::Failed(e.to_string()));
-            return;
+    match &query {
+        // Custom scope: a full (non-incremental) scan of the query results.
+        Some(q) => {
+            em.send(ScanEvent::Status(format!("Scanning: {q}…")));
+            match provider.list_query_ids(q, limit).await {
+                Ok(ids) => full_sync(&em, provider.as_ref(), &ids).await,
+                Err(e) => {
+                    em.send(ScanEvent::Failed(e.to_string()));
+                    return;
+                }
+            }
         }
-    };
-
-    if result.full {
-        full_sync(&em, provider.as_ref(), &result.added).await;
-    } else {
-        incremental_sync(&em, provider.as_ref(), &cache, &result).await;
+        // Inbox: incremental sync from the stored checkpoint.
+        None => {
+            let token = cache.get_state("history_id").await.ok().flatten();
+            em.send(ScanEvent::Status("Syncing inbox…".to_string()));
+            let result = match provider.inbox_sync(token.as_deref(), limit).await {
+                Ok(r) => r,
+                Err(e) => {
+                    em.send(ScanEvent::Failed(e.to_string()));
+                    return;
+                }
+            };
+            if result.full {
+                full_sync(&em, provider.as_ref(), &result.added).await;
+            } else {
+                incremental_sync(&em, provider.as_ref(), &cache, &result).await;
+            }
+            let _ = cache.set_state("history_id", &result.next_token).await;
+        }
     }
-    let _ = cache.set_state("history_id", &result.next_token).await;
 
     // Attachment details: serve cached ones instantly, fetch only the rest
     // (and persist them, so reruns don't re-fetch).
@@ -1300,6 +1349,9 @@ async fn event_loop<B: Backend + io::Write>(
                             run_pending(app, &provider, &em, pending);
                         }
                     }
+                    KeyOutcome::Rescan => {
+                        restart_scan(accounts_ctx, app, epoch, handle, tx)
+                    }
                 }
             }
         }
@@ -1395,6 +1447,7 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
         Message(String),
         StartAuth(accounts::Provider),
         ConfirmRun,
+        SetScope(Option<String>),
     }
 
     let act = {
@@ -1456,6 +1509,27 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
                 KeyCode::Char('n') | KeyCode::Esc => Act::Close,
                 _ => Act::None,
             },
+            ModalState::QueryInput { input } => match code {
+                KeyCode::Esc => Act::Close,
+                KeyCode::Enter => {
+                    let q = input.trim();
+                    let scope = if q.is_empty() || q == "in:inbox" {
+                        None
+                    } else {
+                        Some(q.to_string())
+                    };
+                    Act::SetScope(scope)
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    Act::None
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    Act::None
+                }
+                _ => Act::None,
+            },
         }
     };
 
@@ -1472,6 +1546,11 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
         }
         Act::StartAuth(p) => KeyOutcome::StartAuth(p),
         Act::ConfirmRun => KeyOutcome::ConfirmRun,
+        Act::SetScope(scope) => {
+            app.scope_query = scope;
+            app.modal = None;
+            KeyOutcome::Rescan
+        }
     }
 }
 
@@ -1516,6 +1595,9 @@ async fn handle_key(
         KeyCode::Char('3') => app.focus = Panel::Domains,
         KeyCode::Char('4') => app.focus = Panel::Details,
         KeyCode::Char('/') => app.searching = true,
+        KeyCode::Char('f') => {
+            app.modal = Some(Modal::query_input(app.scope_query.clone().unwrap_or_default()));
+        }
         KeyCode::Tab => app.set_view(app.view.next()),
         KeyCode::BackTab => app.set_view(app.view.prev()),
         KeyCode::Char('l') | KeyCode::Right => app.expand(),
@@ -2145,6 +2227,27 @@ fn render_modal(f: &mut Frame, modal: &Modal) {
                 )),
             ],
         ),
+        ModalState::QueryInput { input } => (
+            "Scan scope",
+            vec![
+                Line::from("Scan query (Gmail search syntax; empty = inbox):"),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("> {input}"),
+                    Style::default().fg(Color::Cyan),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "e.g.  older_than:1y   larger:5M   is:unread   category:promotions",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter to scan · Esc to cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ],
+        ),
     };
 
     let block = Block::default()
@@ -2184,9 +2287,10 @@ fn render_accounts(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, email)| {
             let active = i == app.active;
             let marker = if active { "●" } else { " " };
-            // Live inbox count (decrements as you delete).
+            // Live count (decrements as you delete).
             let totals = if active {
-                format!("  ({} inbox)", app.metas.len())
+                let what = if app.scope_query.is_some() { "matched" } else { "inbox" };
+                format!("  ({} {what})", app.metas.len())
             } else {
                 String::new()
             };
@@ -2247,12 +2351,17 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
     } else {
         format!(" · /{}", app.search)
     };
+    let scope = match &app.scope_query {
+        Some(q) => format!(" · scope: {q}"),
+        None => String::new(),
+    };
     let title = format!(
-        "[3] Domains ({}{}) · sort {}{}",
+        "[3] Domains ({}{}) · sort {}{}{}",
         app.groups.len(),
         marked,
         app.sort.label(),
-        search
+        search,
+        scope
     );
     let block = panel_block(app, Panel::Domains, title);
     let inner = block.inner(area);

@@ -513,6 +513,10 @@ impl MailProvider for GmailClient {
             .await
     }
 
+    async fn list_query_ids(&self, query: &str, max: usize) -> Result<Vec<String>> {
+        self.list_message_ids(Some(query), max).await
+    }
+
     async fn fetch_metadata(
         &self,
         ids: &[String],

@@ -84,7 +84,9 @@ First launch opens a browser for consent; the token is cached to
   `Enter` to set a credential or add an account.
 - `Tab` / `Shift-Tab` — switch domain view (All / Subscriptions / Attachments)
 - `o` — cycle sort (Messages / Size / Recent), applied to the current view
-- `/` — fuzzy search/filter the list; `gg`/`G` — jump to top/bottom
+- `/` — fuzzy search/filter the loaded list; `f` — server-side scan scope/query
+  (e.g. `older_than:1y`, `larger:5M`, `is:unread`, `category:promotions`; empty = inbox)
+- `gg`/`G` — jump to top/bottom
 - `j`/`k` (or `↑`/`↓`) — move within the focused panel (or scroll Details)
 - `h`/`l` (or `←`/`→`) — collapse / expand the tree (domain → sender → message)
 - `Space` — mark/unmark the selected node; `c` — clear all marks

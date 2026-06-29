@@ -371,6 +371,19 @@ impl MailProvider for OutlookClient {
         .await
     }
 
+    async fn list_query_ids(&self, query: &str, max: usize) -> Result<Vec<String>> {
+        // Graph $search is free-text (KQL); Gmail-style operators won't apply.
+        let enc = query
+            .replace('%', "%25")
+            .replace(' ', "%20")
+            .replace('"', "%22");
+        self.list_ids(
+            format!("{GRAPH}/me/messages?$search=%22{enc}%22&$select=id&$top=100"),
+            max,
+        )
+        .await
+    }
+
     async fn fetch_metadata(
         &self,
         ids: &[String],
