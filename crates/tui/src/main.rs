@@ -938,10 +938,26 @@ async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache) {
     }
     let _ = cache.set_state("history_id", &result.next_token).await;
 
-    // Background: actual attachment filenames/sizes.
-    let total = attachment_ids.len();
-    for (i, id) in attachment_ids.into_iter().enumerate() {
+    // Attachment details: serve cached ones instantly, fetch only the rest
+    // (and persist them, so reruns don't re-fetch).
+    let any = !attachment_ids.is_empty();
+    let cached = cache
+        .get_attachments_many(&attachment_ids)
+        .await
+        .unwrap_or_default();
+    for (id, list) in &cached {
+        em.send(ScanEvent::AttachmentDetails(id.clone(), list.clone()));
+    }
+    let missing: Vec<String> = attachment_ids
+        .iter()
+        .filter(|id| !cached.contains_key(*id))
+        .cloned()
+        .collect();
+
+    let total = missing.len();
+    for (i, id) in missing.into_iter().enumerate() {
         if let Ok(list) = provider.message_attachments(&id).await {
+            let _ = cache.put_attachments(&id, &list).await;
             em.send(ScanEvent::AttachmentDetails(id, list));
         }
         if i % 25 == 0 {
@@ -952,9 +968,10 @@ async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache) {
         }
         sleep(Duration::from_millis(120)).await;
     }
-    if total > 0 {
+    if any {
         em.send(ScanEvent::Notice(format!(
-            "Attachment sizes loaded ({total} messages)"
+            "Attachment sizes ready ({} messages)",
+            attachment_ids.len()
         )));
         em.send(ScanEvent::AttachmentsSettled);
     }

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
+use crate::gmail::AttachmentInfo;
 use crate::model::MessageMeta;
 
 /// Bump whenever the cached row shape changes. On mismatch the cache is reset
@@ -36,10 +37,15 @@ impl Cache {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
         if version != SCHEMA_VERSION {
-            // Drop messages AND state together: a stale history checkpoint with
-            // an empty message table would yield a near-empty incremental sync.
-            conn.execute_batch("DROP TABLE IF EXISTS messages; DROP TABLE IF EXISTS state;")
-                .context("resetting outdated cache")?;
+            // Drop everything together: a stale history checkpoint with an empty
+            // message table would yield a near-empty incremental sync.
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS messages;
+                 DROP TABLE IF EXISTS state;
+                 DROP TABLE IF EXISTS attachments;
+                 DROP TABLE IF EXISTS attachment_state;",
+            )
+            .context("resetting outdated cache")?;
         }
 
         conn.execute_batch(
@@ -57,6 +63,17 @@ impl Cache {
             CREATE TABLE IF NOT EXISTS state (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS attachments (
+                message_id    TEXT NOT NULL,
+                attachment_id TEXT NOT NULL,
+                filename      TEXT NOT NULL,
+                mime_type     TEXT NOT NULL,
+                size          INTEGER NOT NULL,
+                PRIMARY KEY (message_id, attachment_id)
+            );
+            CREATE TABLE IF NOT EXISTS attachment_state (
+                message_id TEXT PRIMARY KEY
             );",
         )
         .context("initializing cache schema")?;
@@ -216,9 +233,90 @@ impl Cache {
             let mut conn = conn.lock().expect("cache mutex poisoned");
             let tx = conn.transaction()?;
             {
-                let mut stmt = tx.prepare("DELETE FROM messages WHERE id = ?1")?;
+                let mut msg = tx.prepare("DELETE FROM messages WHERE id = ?1")?;
+                let mut att = tx.prepare("DELETE FROM attachments WHERE message_id = ?1")?;
+                let mut state = tx.prepare("DELETE FROM attachment_state WHERE message_id = ?1")?;
                 for id in &ids {
-                    stmt.execute(params![id])?;
+                    msg.execute(params![id])?;
+                    att.execute(params![id])?;
+                    state.execute(params![id])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Load cached attachment details for any of `ids` already resolved.
+    /// Resolved messages appear in the map (possibly with an empty list).
+    pub async fn get_attachments_many(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, Vec<AttachmentInfo>>> {
+        let conn = self.conn.clone();
+        let ids = ids.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<HashMap<String, Vec<AttachmentInfo>>> {
+            let conn = conn.lock().expect("cache mutex poisoned");
+            let mut resolved = conn.prepare("SELECT 1 FROM attachment_state WHERE message_id = ?1")?;
+            let mut details = conn.prepare(
+                "SELECT attachment_id, filename, mime_type, size
+                 FROM attachments WHERE message_id = ?1",
+            )?;
+            let mut out = HashMap::new();
+            for id in &ids {
+                if !resolved.exists(params![id])? {
+                    continue;
+                }
+                let rows = details.query_map(params![id], |r| {
+                    Ok(AttachmentInfo {
+                        attachment_id: r.get(0)?,
+                        filename: r.get(1)?,
+                        mime_type: r.get(2)?,
+                        size: r.get(3)?,
+                    })
+                })?;
+                let mut list = Vec::new();
+                for row in rows {
+                    list.push(row?);
+                }
+                out.insert(id.clone(), list);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    /// Store a message's attachment details and mark it resolved.
+    pub async fn put_attachments(&self, message_id: &str, atts: &[AttachmentInfo]) -> Result<()> {
+        let conn = self.conn.clone();
+        let message_id = message_id.to_string();
+        let atts = atts.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = conn.lock().expect("cache mutex poisoned");
+            let tx = conn.transaction()?;
+            {
+                tx.execute(
+                    "INSERT OR REPLACE INTO attachment_state (message_id) VALUES (?1)",
+                    params![message_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM attachments WHERE message_id = ?1",
+                    params![message_id],
+                )?;
+                let mut stmt = tx.prepare(
+                    "INSERT OR REPLACE INTO attachments
+                        (message_id, attachment_id, filename, mime_type, size)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                for a in &atts {
+                    stmt.execute(params![
+                        message_id,
+                        a.attachment_id,
+                        a.filename,
+                        a.mime_type,
+                        a.size
+                    ])?;
                 }
             }
             tx.commit()?;
