@@ -77,7 +77,8 @@ impl Cache {
             );",
         )
         .context("initializing cache schema")?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION).ok();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .ok();
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -123,9 +124,11 @@ impl Cache {
         let key = key.to_string();
         tokio::task::spawn_blocking(move || -> Result<Option<String>> {
             let conn = conn.lock().expect("cache mutex poisoned");
-            match conn.query_row("SELECT value FROM state WHERE key = ?1", params![key], |r| {
-                r.get::<_, String>(0)
-            }) {
+            match conn.query_row(
+                "SELECT value FROM state WHERE key = ?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            ) {
                 Ok(v) => Ok(Some(v)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(e) => Err(e.into()),
@@ -258,7 +261,8 @@ impl Cache {
         let ids = ids.to_vec();
         tokio::task::spawn_blocking(move || -> Result<HashMap<String, Vec<AttachmentInfo>>> {
             let conn = conn.lock().expect("cache mutex poisoned");
-            let mut resolved = conn.prepare("SELECT 1 FROM attachment_state WHERE message_id = ?1")?;
+            let mut resolved =
+                conn.prepare("SELECT 1 FROM attachment_state WHERE message_id = ?1")?;
             let mut details = conn.prepare(
                 "SELECT attachment_id, filename, mime_type, size
                  FROM attachments WHERE message_id = ?1",

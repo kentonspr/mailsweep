@@ -23,9 +23,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -40,13 +38,15 @@ use mailsweep_core::{
     MessageMeta, Profile, SenderEntry, SyncResult, UnsubscribeInfo,
 };
 
-const HELP: &str =
-    "/ search · o sort · j/k move · h/l fold · <Space> mark · ? help · q quit";
+const HELP: &str = "/ search · o sort · j/k move · h/l fold · <Space> mark · ? help · q quit";
 
 /// (keys, description) rows for the `?` help modal.
 const HELP_KEYS: &[(&str, &str)] = &[
     ("1 2 3 4", "Focus Accounts / Config / Domains / Details"),
-    ("Tab / S-Tab", "Switch view (All / Subscriptions / Attachments)"),
+    (
+        "Tab / S-Tab",
+        "Switch view (All / Subscriptions / Attachments)",
+    ),
     ("o", "Cycle sort (Messages / Size / Recent)"),
     ("/", "Search / filter the loaded list"),
     ("f", "Scan scope / query (Tab for examples)"),
@@ -1017,8 +1017,11 @@ fn build_account(account: &accounts::Account) -> Result<AccountCtx> {
     let cache = Cache::open(accounts::cache_path(&email))?;
     let provider: Arc<dyn MailProvider> = match account.provider {
         accounts::Provider::Gmail => {
-            let auth =
-                GmailAuth::new(config::secret_path(), accounts::token_path(&email), config::SCOPES);
+            let auth = GmailAuth::new(
+                config::secret_path(),
+                accounts::token_path(&email),
+                config::SCOPES,
+            );
             Arc::new(GmailClient::new(Arc::new(auth)).with_cache(cache.clone()))
         }
         accounts::Provider::Outlook => {
@@ -1109,7 +1112,12 @@ fn restart_scan(
     *epoch += 1;
     app.reset_for_account();
     app.epoch = *epoch;
-    *handle = spawn_scan(*epoch, &accounts_ctx[app.active], app.scope_query.clone(), tx);
+    *handle = spawn_scan(
+        *epoch,
+        &accounts_ctx[app.active],
+        app.scope_query.clone(),
+        tx,
+    );
 }
 
 fn switch_account(
@@ -1128,7 +1136,12 @@ fn switch_account(
     restart_scan(accounts_ctx, app, epoch, handle, tx);
 }
 
-async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache, query: Option<String>) {
+async fn run_scan(
+    em: Emitter,
+    provider: Arc<dyn MailProvider>,
+    cache: Cache,
+    query: Option<String>,
+) {
     em.send(ScanEvent::Status("Authenticating…".to_string()));
     match provider.profile().await {
         Ok(p) => em.send(ScanEvent::Account(p)),
@@ -1144,7 +1157,11 @@ async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache, qu
     // streams in (scoped to the query when one is set).
     let attachment_ids = match &query {
         None => provider.list_attachment_ids(limit).await,
-        Some(q) => provider.list_query_ids(&format!("{q} has:attachment"), limit).await,
+        Some(q) => {
+            provider
+                .list_query_ids(&format!("{q} has:attachment"), limit)
+                .await
+        }
     }
     .unwrap_or_default();
     em.send(ScanEvent::AttachmentIds(
@@ -1208,10 +1225,7 @@ async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache, qu
             let _ = cache.put_attachments(&id, &list).await;
             em.send(ScanEvent::AttachmentDetails(id, list));
         }
-        em.send(ScanEvent::AttachmentProgress {
-            done: i + 1,
-            total,
-        });
+        em.send(ScanEvent::AttachmentProgress { done: i + 1, total });
         sleep(Duration::from_millis(120)).await;
     }
     if any {
@@ -1248,7 +1262,12 @@ async fn full_sync(em: &Emitter, provider: &dyn MailProvider, ids: &[String]) {
 }
 
 /// Incremental: rebuild from the cache plus the sync deltas.
-async fn incremental_sync(em: &Emitter, provider: &dyn MailProvider, cache: &Cache, result: &SyncResult) {
+async fn incremental_sync(
+    em: &Emitter,
+    provider: &dyn MailProvider,
+    cache: &Cache,
+    result: &SyncResult,
+) {
     em.send(ScanEvent::Status("Incremental sync…".to_string()));
 
     let mut base = cache.all().await.unwrap_or_default();
@@ -1336,7 +1355,9 @@ async fn event_loop<B: Backend + io::Write>(
                 match handle_key(app, &provider, &em, key.code).await {
                     KeyOutcome::Quit => break,
                     KeyOutcome::None => {}
-                    KeyOutcome::Switch(i) => switch_account(i, accounts_ctx, app, epoch, handle, tx),
+                    KeyOutcome::Switch(i) => {
+                        switch_account(i, accounts_ctx, app, epoch, handle, tx)
+                    }
                     KeyOutcome::AddAccount(provider) => {
                         if provider_configured(provider) {
                             app.modal = Some(Modal::working(provider));
@@ -1360,9 +1381,7 @@ async fn event_loop<B: Backend + io::Write>(
                             run_pending(app, &provider, &em, pending);
                         }
                     }
-                    KeyOutcome::Rescan => {
-                        restart_scan(accounts_ctx, app, epoch, handle, tx)
-                    }
+                    KeyOutcome::Rescan => restart_scan(accounts_ctx, app, epoch, handle, tx),
                 }
             }
         }
@@ -1432,7 +1451,14 @@ fn handle_auth_done(
                     Ok(ctx) => {
                         accounts_ctx.push(ctx);
                         app.accounts.push(email.clone());
-                        switch_account(accounts_ctx.len() - 1, accounts_ctx, app, epoch, handle, tx);
+                        switch_account(
+                            accounts_ctx.len() - 1,
+                            accounts_ctx,
+                            app,
+                            epoch,
+                            handle,
+                            tx,
+                        );
                         app.modal = Some(Modal::message(format!("Added {email}")));
                     }
                     Err(e) => app.modal = Some(Modal::message(format!("Failed: {e}"))),
@@ -1512,7 +1538,9 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
                 _ => Act::None,
             },
             ModalState::Help => match code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => Act::Close,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+                    Act::Close
+                }
                 _ => Act::None,
             },
             ModalState::Confirm(_) => match code {
@@ -1728,7 +1756,11 @@ fn run_archive(
         .unwrap_or(0);
     let path = config::archive_dir().join(format!("{account}-{ts}.zip"));
 
-    let verb = if delete_after { "Archiving + deleting" } else { "Archiving" };
+    let verb = if delete_after {
+        "Archiving + deleting"
+    } else {
+        "Archiving"
+    };
     app.notify(format!("{verb} {} message(s)…", items.len()));
     app.pending_ops += 1;
     let provider = provider.clone();
@@ -1839,7 +1871,11 @@ fn act(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, action: Ac
         return;
     }
     if action.removes() && ids.len() > CONFIRM_THRESHOLD {
-        let prompt = format!("{} {} message(s) from {label}?", action.confirm_verb(), ids.len());
+        let prompt = format!(
+            "{} {} message(s) from {label}?",
+            action.confirm_verb(),
+            ids.len()
+        );
         app.pending = Some(Pending::Act(action, ids, label));
         app.modal = Some(Modal::confirm(prompt));
     } else {
@@ -1924,7 +1960,10 @@ fn unsubscribe(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, de
     let ids = target.ids.clone();
 
     if delete_after && ids.len() > CONFIRM_THRESHOLD {
-        let prompt = format!("Unsubscribe and delete {} message(s) from {label}?", ids.len());
+        let prompt = format!(
+            "Unsubscribe and delete {} message(s) from {label}?",
+            ids.len()
+        );
         app.pending = Some(Pending::UnsubDelete(info, ids, label));
         app.modal = Some(Modal::confirm(prompt));
         return;
@@ -2003,13 +2042,13 @@ fn ui(f: &mut Frame, app: &App) {
     ])
     .split(f.area());
 
-    let top = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(rows[0]);
+    let top =
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(rows[0]);
     render_accounts(f, app, top[0]);
     render_config(f, app, top[1]);
 
-    let body = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(rows[1]);
+    let body =
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(rows[1]);
     render_domains(f, app, body[0]);
     // Right column: Details on top, a small Activity panel at the bottom.
     let right = Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).split(body[1]);
@@ -2330,7 +2369,9 @@ fn render_modal(f: &mut Frame, modal: &Modal) {
         .border_style(Style::default().fg(Color::Yellow))
         .title(title);
     f.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -2364,7 +2405,11 @@ fn render_accounts(f: &mut Frame, app: &App, area: Rect) {
             let marker = if active { "●" } else { " " };
             // Live count (decrements as you delete).
             let totals = if active {
-                let what = if app.scope_query.is_some() { "matched" } else { "inbox" };
+                let what = if app.scope_query.is_some() {
+                    "matched"
+                } else {
+                    "inbox"
+                };
                 format!("  ({} {what})", app.metas.len())
             } else {
                 String::new()
@@ -2481,7 +2526,11 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let list_area = *chunks.last().expect("list chunk present");
-    let items: Vec<ListItem> = app.rows().iter().map(|r| ListItem::new(row_line(app, r))).collect();
+    let items: Vec<ListItem> = app
+        .rows()
+        .iter()
+        .map(|r| ListItem::new(row_line(app, r)))
+        .collect();
 
     let mut state = ListState::default();
     if !items.is_empty() {
@@ -2567,8 +2616,12 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
         return vec![Line::from("No selection.")];
     };
 
-    let bold =
-        |s: String| Line::from(Span::styled(s, Style::default().add_modifier(Modifier::BOLD)));
+    let bold = |s: String| {
+        Line::from(Span::styled(
+            s,
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+    };
     let underline = |s: &str| {
         Line::from(Span::styled(
             s.to_string(),
@@ -2681,22 +2734,40 @@ fn filter_by_search(groups: Vec<DomainGroup>, query: &str) -> Vec<DomainGroup> {
 /// Sort a tree of domains/senders/messages in place by the chosen mode.
 fn apply_sort(groups: &mut [DomainGroup], sort: SortMode, size_of: &impl Fn(&MessageMeta) -> u64) {
     let sender_size = |s: &SenderEntry| -> u64 { s.messages.iter().map(|m| size_of(m)).sum() };
-    let sender_recent = |s: &SenderEntry| s.messages.iter().map(|m| m.internal_date).max().unwrap_or(0);
+    let sender_recent = |s: &SenderEntry| {
+        s.messages
+            .iter()
+            .map(|m| m.internal_date)
+            .max()
+            .unwrap_or(0)
+    };
     let domain_size = |g: &DomainGroup| -> u64 { g.senders.iter().map(|s| sender_size(s)).sum() };
-    let domain_recent =
-        |g: &DomainGroup| g.senders.iter().flat_map(|s| &s.messages).map(|m| m.internal_date).max().unwrap_or(0);
+    let domain_recent = |g: &DomainGroup| {
+        g.senders
+            .iter()
+            .flat_map(|s| &s.messages)
+            .map(|m| m.internal_date)
+            .max()
+            .unwrap_or(0)
+    };
 
     for g in groups.iter_mut() {
         for s in g.senders.iter_mut() {
             match sort {
                 SortMode::Size => s.messages.sort_by(|a, b| size_of(b).cmp(&size_of(a))),
-                _ => s.messages.sort_by(|a, b| b.internal_date.cmp(&a.internal_date)),
+                _ => s
+                    .messages
+                    .sort_by(|a, b| b.internal_date.cmp(&a.internal_date)),
             }
         }
         match sort {
             SortMode::Messages => g.senders.sort_by(|a, b| b.count().cmp(&a.count())),
-            SortMode::Size => g.senders.sort_by(|a, b| sender_size(b).cmp(&sender_size(a))),
-            SortMode::Recent => g.senders.sort_by(|a, b| sender_recent(b).cmp(&sender_recent(a))),
+            SortMode::Size => g
+                .senders
+                .sort_by(|a, b| sender_size(b).cmp(&sender_size(a))),
+            SortMode::Recent => g
+                .senders
+                .sort_by(|a, b| sender_recent(b).cmp(&sender_recent(a))),
         }
     }
     match sort {

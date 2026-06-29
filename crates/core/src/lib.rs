@@ -16,9 +16,7 @@ pub mod unsubscribe;
 pub use archive::{archive_messages, ArchiveItem, ArchiveScope, ArchiveSummary};
 pub use auth::{AuthPrompt, GmailAuth};
 pub use cache::Cache;
-pub use gmail::{
-    AttachmentInfo, FetchProgress, FetchReport, GmailClient, HistoryDelta, Profile,
-};
+pub use gmail::{AttachmentInfo, FetchProgress, FetchReport, GmailClient, HistoryDelta, Profile};
 pub use model::{
     group_by_domain, group_messages, DomainGroup, MessageBody, MessageMeta, SenderEntry,
     SenderGroup,

@@ -574,11 +574,7 @@ impl MailProvider for GmailClient {
         GmailClient::message_attachments(self, id).await
     }
 
-    async fn download_attachment(
-        &self,
-        message_id: &str,
-        attachment_id: &str,
-    ) -> Result<Vec<u8>> {
+    async fn download_attachment(&self, message_id: &str, attachment_id: &str) -> Result<Vec<u8>> {
         GmailClient::download_attachment(self, message_id, attachment_id).await
     }
 
@@ -617,7 +613,9 @@ impl MailProvider for GmailClient {
             .or_else(|| part_text(p, "text/html").map(|h| strip_html(&h)))
             .unwrap_or_default();
         Ok(MessageBody {
-            subject: header(&p.headers, "Subject").unwrap_or("(no subject)").to_string(),
+            subject: header(&p.headers, "Subject")
+                .unwrap_or("(no subject)")
+                .to_string(),
             from: header(&p.headers, "From").unwrap_or_default().to_string(),
             to: header(&p.headers, "To").unwrap_or_default().to_string(),
             date_ms: resp.internal_date.parse().unwrap_or(0),
@@ -668,7 +666,10 @@ async fn batch_get(
     let resp = http
         .post(BATCH_URL)
         .header("Authorization", bearer)
-        .header(CONTENT_TYPE, format!("multipart/mixed; boundary={boundary}"))
+        .header(
+            CONTENT_TYPE,
+            format!("multipart/mixed; boundary={boundary}"),
+        )
         .body(body)
         .send()
         .await?
@@ -917,7 +918,10 @@ mod tests {
             parse_from("\"Quoted, Name\" <x@y.com>"),
             (Some("Quoted, Name".to_string()), "x@y.com".to_string())
         );
-        assert_eq!(parse_from("bare@host.com"), (None, "bare@host.com".to_string()));
+        assert_eq!(
+            parse_from("bare@host.com"),
+            (None, "bare@host.com".to_string())
+        );
     }
 
     #[test]

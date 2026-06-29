@@ -175,14 +175,12 @@ pub async fn add_account(provider: Provider, on_prompt: PromptFn) -> Result<Stri
     let email = match provider {
         Provider::Gmail => {
             gmail_consent(&pending_token, on_prompt).await?;
-            let auth =
-                GmailAuth::new(config::secret_path(), pending_token.clone(), config::SCOPES);
+            let auth = GmailAuth::new(config::secret_path(), pending_token.clone(), config::SCOPES);
             GmailClient::new(Arc::new(auth)).profile().await?.email
         }
         Provider::Outlook => {
-            let client_id = config::ms_client_id().context(
-                "set your Azure app id (Outlook) before adding the account",
-            )?;
+            let client_id = config::ms_client_id()
+                .context("set your Azure app id (Outlook) before adding the account")?;
             let auth = MsAuth::new(client_id, pending_token.clone());
             auth.device_login(on_prompt.as_ref()).await?;
             OutlookClient::new(Arc::new(auth)).profile().await?.email

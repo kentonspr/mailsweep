@@ -128,7 +128,10 @@ impl DomainGroup {
     }
 
     pub fn message_ids(&self) -> Vec<String> {
-        self.senders.iter().flat_map(SenderEntry::message_ids).collect()
+        self.senders
+            .iter()
+            .flat_map(SenderEntry::message_ids)
+            .collect()
     }
 }
 
@@ -163,7 +166,8 @@ pub fn group_messages(messages: &[MessageMeta]) -> Vec<DomainGroup> {
         .map(|(domain, senders_map)| {
             let mut senders: Vec<SenderEntry> = senders_map.into_values().collect();
             for s in &mut senders {
-                s.messages.sort_by(|a, b| b.internal_date.cmp(&a.internal_date));
+                s.messages
+                    .sort_by(|a, b| b.internal_date.cmp(&a.internal_date));
             }
             senders.sort_by(|a, b| b.count().cmp(&a.count()));
             let unsubscribe = senders.iter().find_map(|s| s.unsubscribe.clone());
@@ -183,10 +187,12 @@ pub fn group_by_domain(messages: &[MessageMeta]) -> Vec<SenderGroup> {
     let mut map: HashMap<String, SenderGroup> = HashMap::new();
 
     for m in messages {
-        let entry = map.entry(m.domain().to_string()).or_insert_with(|| SenderGroup {
-            domain: m.domain().to_string(),
-            ..Default::default()
-        });
+        let entry = map
+            .entry(m.domain().to_string())
+            .or_insert_with(|| SenderGroup {
+                domain: m.domain().to_string(),
+                ..Default::default()
+            });
 
         entry.message_ids.push(m.id.clone());
         *entry.senders.entry(m.from_email.clone()).or_default() += 1;

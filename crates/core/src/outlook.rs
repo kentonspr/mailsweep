@@ -149,10 +149,7 @@ impl MsAuth {
                 .post(format!("{AUTH}/token"))
                 .form(&[
                     ("client_id", self.client_id.as_str()),
-                    (
-                        "grant_type",
-                        "urn:ietf:params:oauth:grant-type:device_code",
-                    ),
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                     ("device_code", code.device_code.as_str()),
                 ])
                 .send()
@@ -293,7 +290,9 @@ impl MailProvider for OutlookClient {
             .await?;
         let inbox: MailFolder = self
             .http
-            .get(format!("{GRAPH}/me/mailFolders/inbox?$select=totalItemCount"))
+            .get(format!(
+                "{GRAPH}/me/mailFolders/inbox?$select=totalItemCount"
+            ))
             .header("Authorization", &bearer)
             .send()
             .await?
@@ -591,11 +590,7 @@ impl MailProvider for OutlookClient {
             .collect())
     }
 
-    async fn download_attachment(
-        &self,
-        message_id: &str,
-        attachment_id: &str,
-    ) -> Result<Vec<u8>> {
+    async fn download_attachment(&self, message_id: &str, attachment_id: &str) -> Result<Vec<u8>> {
         let bearer = self.bearer().await?;
         let bytes = self
             .http

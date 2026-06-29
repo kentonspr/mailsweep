@@ -1,140 +1,130 @@
 # Mailsweep
 
-A local tool for cleaning out an email account. Groups inbox messages by sender
-domain and lets you bulk-trash, mark-spam, or unsubscribe. Gmail today; the
-`MailProvider` trait leaves room for Outlook (Microsoft Graph) and IMAP
-providers (Yahoo, etc.) later.
+A fast terminal app for **cleaning out an overgrown mailbox**. It groups your
+mail into a domain → sender → message tree, surfaces unsubscribe links and big
+attachments, and lets you bulk-trash, spam, mark-read, unsubscribe, and archive —
+across thousands of messages at a time.
 
-Each user runs it against their own account, so it stays within Gmail's OAuth
-"testing" mode — no app verification or security assessment required.
+Runs entirely on your machine against your **own** account credentials. No
+servers, no telemetry.
+
+> ⚠️ **Alpha — use at your own risk.** Mailsweep modifies real email. It has had
+> limited testing against live accounts (Gmail more than Outlook), so treat it as
+> experimental. Trash/spam are reversible and there's an undo (`z`) and a
+> confirmation gate for large batches — but review what an action will do before
+> confirming. See [SECURITY.md](SECURITY.md).
+
+## Features
+
+- **Domain → sender → message tree** with live counts and sizes.
+- **Views**: All · Subscriptions (senders with an unsubscribe header) ·
+  Attachments. Sort by message count, total size, or recency.
+- **Bulk actions** on a marked set or the selected node: trash, spam, mark read,
+  unsubscribe, **unsubscribe + delete**, archive, **archive + delete**.
+- **Fuzzy search** (`/`) over the loaded list, and **server-side scan scope**
+  (`f`) — `older_than:1y`, `larger:5M`, `is:unread`, `category:promotions`, …
+- **Archive** selected messages to a zip of `.eml` files + extracted attachments
+  + a `manifest.json`.
+- **Message viewer** (`Enter`) — read the body without leaving the terminal.
+- **Undo** (`z`), a **confirmation gate** for big deletes, and a single-instance
+  lock so two copies don't fight over the cache.
+- **Multiple accounts**, **incremental sync**, on-disk caching, vim-style keys.
+
+## Provider support
+
+| Provider | Status |
+| --- | --- |
+| **Gmail / Google Workspace** | Primary target; the most-exercised path |
+| **Outlook / Hotmail** (consumer, via Microsoft Graph) | Implemented but **experimental / untested** |
+| IMAP (Yahoo, iCloud, Fastmail, …) | Planned — hangs off the `MailProvider` trait |
+
+## Install
+
+Build from source (needs a recent stable Rust toolchain):
+
+```sh
+git clone <repo-url> mailsweep && cd mailsweep
+cargo run -p mailsweep-tui
+```
+
+## Setup
+
+Mailsweep uses **your own** OAuth client (Gmail's modify scope is "restricted," so
+a shared public client would need Google's paid verification). Creating one is a
+free, one-time setup:
+
+- **Gmail** → [`docs/gmail-setup.md`](docs/gmail-setup.md)
+- **Outlook** → [`docs/outlook-setup.md`](docs/outlook-setup.md)
+
+Then it's all in-app: launch, focus the **Config** panel (`2`), and pick
+**Set Gmail/Outlook credential** (paste the value/JSON or a path), then
+**+ Add Gmail/Outlook account** to sign in (browser for Gmail, device code for
+Outlook). Switch between accounts in the **Accounts** panel (`1`).
+
+## Keys
+
+| Key | Action |
+| --- | --- |
+| `1` `2` `3` `4` | Focus Accounts / Config / Domains / Details |
+| `Tab` / `Shift-Tab` | Switch view (All / Subscriptions / Attachments) |
+| `o` | Cycle sort (Messages / Size / Recent) |
+| `/` | Fuzzy-search the loaded list |
+| `f` | Server-side scan scope / query (`Tab` for examples) |
+| `j` `k` / arrows | Move (or scroll the focused panel) |
+| `h` `l` / arrows | Collapse / expand the tree |
+| `gg` / `G` | Jump to top / bottom |
+| `Space` / `c` | Mark / unmark · clear all marks |
+| `Enter` | Open the selected message |
+| `a` / `A` | Archive · archive **and** delete |
+| `d` / `s` / `r` | Trash · spam · mark read |
+| `u` / `U` | Unsubscribe · unsubscribe **and** delete |
+| `z` | Undo the last delete (restore to inbox) |
+| `?` | Full key help · `q` quit |
+
+Actions apply to the marked set (`●`/`◐`) if any, otherwise the selected
+domain/sender/message. Destructive actions over 100 messages ask `y`/`n`.
+
+## How it works
+
+- **Background sync** — the inbox is fetched on a background task; the tree fills
+  in live with a progress bar. The scan covers the whole inbox by default; set
+  `MAILSWEEP_SCAN_LIMIT=N` to cap it.
+- **Incremental** — after a full sync, a `historyId`/delta checkpoint is stored
+  and reruns fetch only what changed (no full re-listing). Falls back to a full
+  sync if the checkpoint expires.
+- **Caching** — message metadata and attachment details are cached in SQLite per
+  account, so reruns are fast and quota-cheap. Gmail metadata is fetched via the
+  `multipart/mixed` batch endpoint, paced under the per-user quota.
+
+## Data & privacy
+
+Config (your OAuth client credentials) lives in `~/.config/mailsweep/`; per-account
+tokens, caches, and archives in `~/.local/share/mailsweep/`. The token files grant
+mailbox access — guard them. Full details, scopes, and how to revoke access:
+[SECURITY.md](SECURITY.md).
 
 ## Layout
 
 ```
 crates/
-  core/   shared library: providers (Gmail/Outlook), sync, cache, archive
+  core/   library: providers (Gmail/Outlook), sync, cache, archive, unsubscribe
   tui/    ratatui terminal frontend  (binary: mailsweep)
 ```
 
-## Multiple accounts & providers
+## Contributing
 
-Mailsweep supports **Gmail** and **Outlook/Hotmail** (consumer Microsoft
-accounts, via Microsoft Graph). Configuration (your OAuth client credentials)
-lives in `~/.config/mailsweep/`; per-account data (tokens, metadata caches) and
-archives live in `~/.local/share/mailsweep/`.
-
-Everything is set up **in the app** — no manual file placement required. Focus
-the Accounts panel (`1`), move with `j`/`k`, and press `Enter` on an account to
-switch, or on `[+ Add Gmail account]` / `[+ Add Outlook account]` to add one. A
-modal wizard walks you through it: if that provider's credential isn't set yet,
-it prompts for it (paste the value/JSON, or a path to the file), then runs
-sign-in — a browser for Gmail, or a device code shown in the modal for Outlook.
-The **Config panel** (`2`) shows credential status; press `g`/`o` there to set
-the Gmail/Outlook credential directly. An existing single-account Gmail setup is
-migrated automatically.
-
-- **Gmail**: browser consent (see Google setup below). In "testing" mode, every
-  Gmail account you add must be a **test user** in your Cloud project.
-- **Outlook**: device-code sign-in — the app prints a URL and code to enter in
-  any browser. Requires your own Azure "public client" app id in
-  `MAILSWEEP_MS_CLIENT_ID` (or `~/.config/mailsweep/ms_client_id`), with the
-  `Mail.ReadWrite`, `User.Read`, and `offline_access` delegated permissions and
-  "Allow public client flows" enabled.
-
-Provider differences: Outlook doesn't expose a per-message size, so the Size
-sort/column shows attachment sizes only (message sizes read as 0); everything
-else (tree, tabs, marks, archive, unsubscribe, incremental delta sync) works the
-same.
-
-## One-time Google setup
-
-1. In the [Google Cloud Console](https://console.cloud.google.com/), create a
-   project and enable the **Gmail API**.
-2. Configure the OAuth consent screen as **External**, in **Testing** mode, and
-   add your Google account under **Test users**.
-3. Create an **OAuth client ID** of type **Desktop app**. Download the JSON.
-4. Save it where the app expects it, or point at it via env var:
-
-   ```sh
-   # Default location (Linux): ~/.config/mailsweep/client_secret.json
-   export MAILSWEEP_CLIENT_SECRET=/path/to/client_secret.json
-   ```
-
-The requested scope is `gmail.modify` — it can read, trash, and relabel mail,
-but **cannot permanently delete** (deletions go to Trash and are reversible).
-
-## Run
+Adding a mail provider is the most self-contained way to help: implement the
+`MailProvider` trait in `crates/core/src/provider.rs` (see `gmail/` and
+`outlook.rs` for examples) and wire it into `accounts.rs`. Before sending a
+change, please run:
 
 ```sh
-cargo run -p mailsweep-tui
+cargo fmt
+cargo clippy --workspace
+cargo test --workspace
 ```
 
-First launch opens a browser (Gmail) or shows a device code (Outlook) for
-consent; tokens are cached per account under `~/.local/share/mailsweep/`.
+## License
 
-### Keys (TUI)
-
-- `1`/`2`/`3`/`4` — focus the Accounts / Config / Domains / Details panel.
-  Accounts: `j`/`k` + `Enter` switches account. Config: credential status +
-  `Enter` to set a credential or add an account.
-- `Tab` / `Shift-Tab` — switch domain view (All / Subscriptions / Attachments)
-- `o` — cycle sort (Messages / Size / Recent), applied to the current view
-- `/` — fuzzy search/filter the loaded list; `f` — server-side scan scope/query
-  (e.g. `older_than:1y`, `larger:5M`, `is:unread`, `category:promotions`; empty = inbox)
-- `gg`/`G` — jump to top/bottom
-- `j`/`k` (or `↑`/`↓`) — move within the focused panel (or scroll Details)
-- `h`/`l` (or `←`/`→`) — collapse / expand the tree (domain → sender → message)
-- `Space` — mark/unmark the selected node; `c` — clear all marks
-- `Enter` — open the selected message in a scrollable viewer (`j`/`k` scroll, `Esc` close)
-- `a` — archive the marked set (or selected node) as `.eml` + attachments
-- `A` — archive **and** trash those messages
-- `d` trash · `s` mark spam · `r` mark read · `u` unsubscribe — acts on the marked set, or the selected node
-- `z` — undo the last delete (restores to inbox)
-- `?` — full key help · `q` — quit
-
-Bulk trash/spam/delete over 100 messages ask for a `y`/`n` confirmation.
-
-Views: **All** (everything), **Subscriptions** (senders with an unsubscribe
-header), **Attachments** (`has:attachment`). Sort each by message count, total
-size, or recency with `o`; under Size sort, aggregate sizes show per
-domain/sender. Marks (`●` full, `◐` partial) let you batch a trash/spam/archive
-across many domains/senders/messages at once.
-
-In the Attachments view, the app fetches each message's **actual** attachment
-sizes/filenames in the background after the sync, so sizes fill in (and `Enter`
-becomes instant) without per-message requests.
-
-The inbox syncs in the background: the domain → sender → message tree fills in as
-messages arrive, with a progress bar until the scan completes.
-
-### Archives
-
-Pressing `a` downloads the selected messages and writes a zip to
-`~/.local/share/mailsweep/archives/<account>-<timestamp>.zip`, organized as
-`<domain>/<sender>/<message-id>.eml` (the full RFC 822 message, attachments
-included) plus extracted `<message-id>__<filename>` attachment files, alongside
-a `manifest.json`. `.eml` opens in Thunderbird / Apple Mail / Outlook.
-
-Only one instance runs at a time (a lock file under the data dir guards the
-shared caches/DBs).
-
-## Performance
-
-- **Metadata cache** — fetched headers are cached in SQLite at
-  `~/.config/mailsweep/metadata.sqlite3` (`core/src/cache.rs`). Rescans only
-  fetch IDs not already cached; trashing/spamming evicts the affected rows.
-- **Batch fetching** — `fetch_metadata` uses Gmail's `multipart/mixed` batch
-  endpoint, bundling up to 100 `messages.get` calls per HTTP request, with
-  several batches in flight at once (`core/src/gmail/client.rs`).
-
-## Notes / next steps
-
-- The scan covers the **whole inbox** by default. Set `MAILSWEEP_SCAN_LIMIT=N`
-  to cap it at N messages (e.g. for a quick look at a huge mailbox).
-- After the first full sync, a `historyId` checkpoint is stored in the cache and
-  subsequent runs do an **incremental sync** (`users.history.list`) — only the
-  adds/removes since last time, rebuilt from the cache, with no full re-listing.
-  If the history has expired (Gmail keeps ~1 week) it transparently falls back
-  to a full sync.
-- Multi-account and multi-provider support (Outlook via Microsoft Graph, Yahoo
-  via IMAP) hang off the `MailProvider` trait in `core/src/provider.rs`.
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
+your option.
