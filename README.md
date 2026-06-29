@@ -44,7 +44,7 @@ Build from source (needs a recent stable Rust toolchain):
 
 ```sh
 git clone <repo-url> mailsweep && cd mailsweep
-cargo run -p mailsweep-tui
+cargo run
 ```
 
 Linux, macOS, and Windows are all supported — the TUI runs in any modern
@@ -120,23 +120,31 @@ mailbox access — guard them. Full details, scopes, and how to revoke access:
 
 ## Layout
 
+A single binary crate. `lib.rs` exposes the library core (mail providers, sync,
+cache, archive, unsubscribe); `main.rs` is the ratatui terminal frontend.
+
 ```
-crates/
-  core/   library: providers (Gmail/Outlook), sync, cache, archive, unsubscribe
-  tui/    ratatui terminal frontend  (binary: mailsweep)
+src/
+  main.rs        ratatui terminal frontend  (binary: mailsweep)
+  lib.rs         library core: re-exports the modules below
+  provider.rs    the MailProvider trait the frontends build on
+  gmail/         Gmail provider (REST)
+  outlook.rs     Outlook provider (Microsoft Graph)
+  imap.rs        generic IMAP provider
+  accounts.rs    per-account storage and the add-account flows
+  model.rs  cache.rs  archive.rs  unsubscribe.rs  auth.rs  config.rs  lock.rs
 ```
 
 ## Contributing
 
 Adding a mail provider is the most self-contained way to help: implement the
-`MailProvider` trait in `crates/core/src/provider.rs` (see `gmail/` and
-`outlook.rs` for examples) and wire it into `accounts.rs`. Before sending a
-change, please run:
+`MailProvider` trait in `src/provider.rs` (see `gmail/` and `outlook.rs` for
+examples) and wire it into `accounts.rs`. Before sending a change, please run:
 
 ```sh
 cargo fmt
-cargo clippy --workspace
-cargo test --workspace
+cargo clippy
+cargo test
 ```
 
 ## License

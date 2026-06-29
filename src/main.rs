@@ -31,9 +31,9 @@ use tokio::time::sleep;
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use mailsweep_core::imap::ImapClient;
-use mailsweep_core::outlook::{MsAuth, OutlookClient};
-use mailsweep_core::{
+use mailsweep::imap::ImapClient;
+use mailsweep::outlook::{MsAuth, OutlookClient};
+use mailsweep::{
     accounts, archive_messages, config, group_messages, ArchiveItem, ArchiveScope, AttachmentInfo,
     AuthPrompt, Cache, DomainGroup, FetchProgress, GmailAuth, GmailClient, MailProvider,
     MessageMeta, Profile, SenderEntry, SyncResult, UnsubscribeInfo,
@@ -729,7 +729,7 @@ impl App {
                 .metas
                 .iter()
                 .filter(|m| {
-                    mailsweep_core::unsubscribe::parse(
+                    mailsweep::unsubscribe::parse(
                         m.list_unsubscribe.as_deref(),
                         m.list_unsubscribe_post.as_deref(),
                     )
@@ -1134,7 +1134,7 @@ impl App {
 async fn main() -> Result<()> {
     config::migrate_to_data_dir();
     // Refuse to start if another instance is live (shared caches/DBs).
-    let _lock = mailsweep_core::lock::InstanceLock::acquire()?;
+    let _lock = mailsweep::lock::InstanceLock::acquire()?;
     let _ = accounts::migrate_legacy_if_needed().await;
     let mut list = accounts::list_accounts();
     if list.is_empty() {
@@ -1953,7 +1953,10 @@ async fn handle_key(
         }
         KeyCode::Char('?') => app.modal = Some(Modal::help()),
         KeyCode::Char('O') => {
-            app.modal = Some(Modal::message_view("Overview".to_string(), overview_lines(app)));
+            app.modal = Some(Modal::message_view(
+                "Overview".to_string(),
+                overview_lines(app),
+            ));
         }
         KeyCode::Enter => match app.focus {
             Panel::Accounts => return app.account_enter(),
@@ -2260,7 +2263,7 @@ fn run_unsubscribe(
     // Manual (non-one-click) methods open immediately, one per distinct sender.
     for info in infos.iter().filter(|i| !i.one_click) {
         if info.http_url.is_some() {
-            let _ = mailsweep_core::unsubscribe::open_in_browser(info);
+            let _ = mailsweep::unsubscribe::open_in_browser(info);
             app.notify(format!("Opened unsubscribe page for {label}"));
         } else if let Some(mailto) = &info.mailto {
             app.notify(format!("Unsubscribe by emailing: {mailto}"));
@@ -2665,7 +2668,12 @@ fn render_modal(f: &mut Frame, modal: &Modal) {
         } => {
             let labels = ["Host", "Port", "Username", "Password"];
             let masked = "*".repeat(password.chars().count());
-            let values = [host.as_str(), port.as_str(), username.as_str(), masked.as_str()];
+            let values = [
+                host.as_str(),
+                port.as_str(),
+                username.as_str(),
+                masked.as_str(),
+            ];
             let mut lines = vec![
                 Line::from("Add a generic IMAP account"),
                 Line::from(Span::styled(
@@ -2841,7 +2849,10 @@ fn render_domains(f: &mut Frame, app: &mut App, area: Rect) {
     constraints.push(Constraint::Min(1));
     let chunks = Layout::vertical(constraints).split(inner);
 
-    f.render_widget(Paragraph::new(tabs_line(app.view, app.sub_filter)), chunks[0]);
+    f.render_widget(
+        Paragraph::new(tabs_line(app.view, app.sub_filter)),
+        chunks[0],
+    );
 
     let header = Line::from(Span::styled(
         format!(

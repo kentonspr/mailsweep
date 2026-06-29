@@ -1064,19 +1064,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
-name = "mailsweep-core"
+name = "mailsweep"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "crossterm",
  "directories",
  "fs2",
  "futures",
+ "fuzzy-matcher",
  "imap",
  "native-tls",
  "open",
+ "ratatui",
  "reqwest",
  "rusqlite",
  "serde",
@@ -1084,19 +1087,6 @@ dependencies = [
  "tokio",
  "yup-oauth2",
  "zip",
-]
-
-[[package]]
-name = "mailsweep-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "crossterm",
- "fuzzy-matcher",
- "mailsweep-core",
- "ratatui",
- "tokio",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
-//! Shared core for Mailsweep: OAuth, the Gmail provider, message grouping,
-//! and unsubscribe handling. Frontends (TUI / GUI) build on top of this.
+//! Library core for Mailsweep: mail providers (Gmail, Outlook, IMAP), OAuth,
+//! sync, caching, message grouping, archiving, and unsubscribe handling. The
+//! `mailsweep` binary (`main.rs`, the terminal UI) builds on top of this.
 
 pub mod accounts;
 pub mod archive;

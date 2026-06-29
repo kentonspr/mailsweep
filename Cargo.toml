@@ -1,15 +1,15 @@
-[workspace]
-resolver = "2"
-members = ["crates/core", "crates/tui"]
-
-[workspace.package]
+[package]
+name = "mailsweep"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Mailsweep contributors"]
-# repository = "https://github.com/<you>/mailsweep"  # set before publishing
+description = "Mailsweep: a terminal app to clean out Gmail, Outlook, and IMAP mailboxes in bulk."
+keywords = ["email", "gmail", "outlook", "tui", "cleanup"]
+categories = ["email", "command-line-utilities"]
+# repository = "https://github.com/kentonspr/mailsweep"  # uncomment before publishing
 
-[workspace.dependencies]
+[dependencies]
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -27,9 +27,6 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
 imap = "2"
 native-tls = "0.2"
-
 ratatui = "0.29"
 crossterm = "0.28"
 fuzzy-matcher = "0.3"
-
-mailsweep-core = { path = "crates/core" }

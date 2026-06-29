@@ -108,16 +108,16 @@ fn fetch_metas(session: &mut Session, uids: &[String]) -> Result<Vec<MessageMeta
     for f in fetches.iter() {
         let Some(uid) = f.uid else { continue };
         let env = f.envelope();
-        let (from_name, from_email) = match env.and_then(|e| e.from.as_ref()).and_then(|v| v.first())
-        {
-            Some(addr) => {
-                let name = cow_string(addr.name);
-                let mbox = cow_string(addr.mailbox).unwrap_or_default();
-                let host = cow_string(addr.host).unwrap_or_default();
-                (name, format!("{mbox}@{host}"))
-            }
-            None => (None, String::new()),
-        };
+        let (from_name, from_email) =
+            match env.and_then(|e| e.from.as_ref()).and_then(|v| v.first()) {
+                Some(addr) => {
+                    let name = cow_string(addr.name);
+                    let mbox = cow_string(addr.mailbox).unwrap_or_default();
+                    let host = cow_string(addr.host).unwrap_or_default();
+                    (name, format!("{mbox}@{host}"))
+                }
+                None => (None, String::new()),
+            };
         let subject = env
             .and_then(|e| cow_string(e.subject))
             .unwrap_or_else(|| "(no subject)".to_string());
@@ -165,7 +165,12 @@ impl MailProvider for ImapClient {
             let mut uids: Vec<u32> = s.uid_search("ALL")?.into_iter().collect();
             let _ = s.logout();
             uids.sort_unstable();
-            Ok(uids.into_iter().rev().take(max).map(|u| u.to_string()).collect())
+            Ok(uids
+                .into_iter()
+                .rev()
+                .take(max)
+                .map(|u| u.to_string())
+                .collect())
         })
         .await??;
         Ok(SyncResult {
@@ -189,7 +194,12 @@ impl MailProvider for ImapClient {
             let mut uids: Vec<u32> = s.uid_search(&query)?.into_iter().collect();
             let _ = s.logout();
             uids.sort_unstable();
-            Ok(uids.into_iter().rev().take(max).map(|u| u.to_string()).collect())
+            Ok(uids
+                .into_iter()
+                .rev()
+                .take(max)
+                .map(|u| u.to_string())
+                .collect())
         })
         .await??;
         Ok(ids)
@@ -295,7 +305,11 @@ impl MailProvider for ImapClient {
         Ok(Vec::new())
     }
 
-    async fn download_attachment(&self, _message_id: &str, _attachment_id: &str) -> Result<Vec<u8>> {
+    async fn download_attachment(
+        &self,
+        _message_id: &str,
+        _attachment_id: &str,
+    ) -> Result<Vec<u8>> {
         bail!("attachment download is not implemented for IMAP")
     }
 
@@ -325,9 +339,7 @@ impl MailProvider for ImapClient {
             let fetches = s.uid_fetch(&uid, "(ENVELOPE INTERNALDATE BODY.PEEK[TEXT])")?;
             let f = fetches.iter().next();
             let env = f.and_then(|f| f.envelope());
-            let subject = env
-                .and_then(|e| cow_string(e.subject))
-                .unwrap_or_default();
+            let subject = env.and_then(|e| cow_string(e.subject)).unwrap_or_default();
             let from = env
                 .and_then(|e| e.from.as_ref())
                 .and_then(|v| v.first())
