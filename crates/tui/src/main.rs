@@ -81,6 +81,11 @@ enum ScanEvent {
     AuthPrompt(Vec<String>),
     /// Sign-in finished: the new account email, or an error.
     AuthDone(accounts::Provider, Result<String, String>),
+    /// Progress of the background attachment-detail fetch.
+    AttachmentProgress {
+        done: usize,
+        total: usize,
+    },
     /// All attachment sizes are loaded — do a final re-sort.
     AttachmentsSettled,
 }
@@ -289,6 +294,10 @@ struct App {
     modal: Option<Modal>,
     /// Throttles re-sorting while attachment sizes stream in.
     last_attach_sort: Instant,
+    /// Background attachment-detail fetch progress.
+    attach_active: bool,
+    attach_done: usize,
+    attach_total: usize,
 }
 
 impl App {
@@ -318,6 +327,9 @@ impl App {
             status: HELP.to_string(),
             modal: None,
             last_attach_sort: Instant::now(),
+            attach_active: false,
+            attach_done: 0,
+            attach_total: 0,
         }
     }
 
@@ -333,6 +345,9 @@ impl App {
         self.expanded_senders.clear();
         self.selected = 0;
         self.detail_scroll = 0;
+        self.attach_active = false;
+        self.attach_done = 0;
+        self.attach_total = 0;
         self.sync = SyncState {
             message: "Starting…".to_string(),
             ..SyncState::default()
@@ -375,7 +390,13 @@ impl App {
                     self.last_attach_sort = Instant::now();
                 }
             }
+            ScanEvent::AttachmentProgress { done, total } => {
+                self.attach_done = done;
+                self.attach_total = total;
+                self.attach_active = total > 0 && done < total;
+            }
             ScanEvent::AttachmentsSettled => {
+                self.attach_active = false;
                 if self.view == View::Attachments {
                     self.rebuild_groups();
                 }
@@ -955,17 +976,18 @@ async fn run_scan(em: Emitter, provider: Arc<dyn MailProvider>, cache: Cache) {
         .collect();
 
     let total = missing.len();
+    if total > 0 {
+        em.send(ScanEvent::AttachmentProgress { done: 0, total });
+    }
     for (i, id) in missing.into_iter().enumerate() {
         if let Ok(list) = provider.message_attachments(&id).await {
             let _ = cache.put_attachments(&id, &list).await;
             em.send(ScanEvent::AttachmentDetails(id, list));
         }
-        if i % 25 == 0 {
-            em.send(ScanEvent::Notice(format!(
-                "Loading attachment sizes… {}/{total}",
-                i + 1
-            )));
-        }
+        em.send(ScanEvent::AttachmentProgress {
+            done: i + 1,
+            total,
+        });
         sleep(Duration::from_millis(120)).await;
     }
     if any {
@@ -1691,9 +1713,9 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     // [tabs][column header][optional gauge][list]
-    let syncing = !app.sync.done;
+    let show_gauge = !app.sync.done || app.attach_active;
     let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
-    if syncing {
+    if show_gauge {
         constraints.push(Constraint::Length(1));
     }
     constraints.push(Constraint::Min(1));
@@ -1710,16 +1732,21 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
     ));
     f.render_widget(Paragraph::new(header), chunks[1]);
 
-    if syncing {
-        let ratio = if app.sync.total > 0 {
-            app.sync.resolved as f64 / app.sync.total as f64
+    if show_gauge {
+        let (done, total, label) = if !app.sync.done {
+            (app.sync.resolved, app.sync.total, "sync")
+        } else {
+            (app.attach_done, app.attach_total, "attachments")
+        };
+        let ratio = if total > 0 {
+            done as f64 / total as f64
         } else {
             0.0
         };
         let gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::Cyan))
             .ratio(ratio.clamp(0.0, 1.0))
-            .label(format!("{}/{}", app.sync.resolved, app.sync.total));
+            .label(format!("{label} {done}/{total}"));
         f.render_widget(gauge, chunks[2]);
     }
 
