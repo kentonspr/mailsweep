@@ -1991,14 +1991,29 @@ fn ui(f: &mut Frame, app: &App) {
     render_history(f, app, right[1]);
 
     let status = if app.searching {
-        Line::from(vec![
-            Span::styled("/", Style::default().fg(Color::Yellow)),
-            Span::raw(app.search.clone()),
-            Span::styled(
+        let mut spans = vec![Span::styled("/", Style::default().fg(Color::Yellow))];
+        if app.search.is_empty() {
+            // Placeholder: explain the filter and show a real example from the
+            // loaded data so it's clear what you can type.
+            let example = app
+                .groups
+                .first()
+                .map(|g| g.domain.clone())
+                .unwrap_or_else(|| "newsletter".to_string());
+            spans.push(Span::styled(
+                format!("filter loaded domains/senders/subjects — e.g. {example}"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        } else {
+            spans.push(Span::raw(app.search.clone()));
+            spans.push(Span::styled(
                 "  (Enter keep · Esc clear)",
                 Style::default().fg(Color::DarkGray),
-            ),
-        ])
+            ));
+        }
+        Line::from(spans)
     } else {
         Line::from(Span::styled(HELP, Style::default().fg(Color::DarkGray)))
     };
