@@ -22,13 +22,68 @@ pub struct MessageMeta {
 }
 
 impl MessageMeta {
-    /// The sender's domain (portion after `@`), or the whole address if absent.
+    /// The sender's full domain (portion after `@`), or the whole address if
+    /// absent — e.g. `marketing.amazon.com`.
     pub fn domain(&self) -> &str {
         self.from_email
             .rsplit('@')
             .next()
             .unwrap_or(&self.from_email)
     }
+
+    /// The registrable (parent) domain used to group senders — e.g.
+    /// `marketing.amazon.com` and `amazon.com` both yield `amazon.com`. See
+    /// [`registrable_domain`].
+    pub fn group_domain(&self) -> &str {
+        registrable_domain(self.domain())
+    }
+}
+
+/// A curated subset of multi-label public suffixes, so that `news.bbc.co.uk`
+/// groups under `bbc.co.uk` rather than the bare suffix `co.uk`. This is *not*
+/// the full Public Suffix List — just the common country/second-level suffixes
+/// we actually see in mail. Unknown suffixes fall back to the last two labels.
+const MULTI_SUFFIXES: &[&str] = &[
+    // United Kingdom
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk",
+    "sch.uk", "nhs.uk",
+    // Australia / New Zealand
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au", "asn.au",
+    "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz", "school.nz",
+    // Japan / Korea / other Asia
+    "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp", "co.kr", "or.kr", "co.in",
+    "co.id", "com.sg", "com.hk", "com.cn", "com.tw", "com.my", "com.ph",
+    // Brazil / LatAm / others
+    "com.br", "com.mx", "com.ar", "com.tr", "co.za", "org.za", "co.il",
+    "com.sa", "com.ua",
+];
+
+/// Reduce a host to its registrable domain (eTLD+1) so subdomains group with
+/// their parent: `mail.amazon.com` and `amazon.com` both become `amazon.com`,
+/// and `news.bbc.co.uk` becomes `bbc.co.uk`.
+///
+/// Uses [`MULTI_SUFFIXES`] for the handful of two-label public suffixes that
+/// matter; everything else is treated as a single-label TLD. Hosts with two or
+/// fewer labels (and anything without a dot, like a bare address) are returned
+/// unchanged.
+pub fn registrable_domain(host: &str) -> &str {
+    let host = host.trim_end_matches('.');
+    let labels: Vec<&str> = host.split('.').collect();
+    let n = labels.len();
+    if n <= 2 {
+        return host;
+    }
+    // How many trailing labels form the public suffix (1 normally, 2 for the
+    // known multi-label suffixes), plus the registrable label itself.
+    let last_two = format!("{}.{}", labels[n - 2], labels[n - 1]);
+    let take = if MULTI_SUFFIXES.contains(&last_two.as_str()) {
+        (3).min(n)
+    } else {
+        2
+    };
+    // Byte offset of the first label we keep.
+    let offset: usize = labels[..n - take].iter().map(|l| l.len() + 1).sum();
+    &host[offset..]
 }
 
 /// All messages from a single sending domain, plus an unsubscribe handle if any.
@@ -144,7 +199,7 @@ pub fn group_messages(messages: &[MessageMeta]) -> Vec<DomainGroup> {
     let mut domains: HashMap<String, HashMap<String, SenderEntry>> = HashMap::new();
 
     for m in messages {
-        let senders = domains.entry(m.domain().to_string()).or_default();
+        let senders = domains.entry(m.group_domain().to_string()).or_default();
         let entry = senders
             .entry(m.from_email.clone())
             .or_insert_with(|| SenderEntry {
@@ -188,9 +243,9 @@ pub fn group_by_domain(messages: &[MessageMeta]) -> Vec<SenderGroup> {
 
     for m in messages {
         let entry = map
-            .entry(m.domain().to_string())
+            .entry(m.group_domain().to_string())
             .or_insert_with(|| SenderGroup {
-                domain: m.domain().to_string(),
+                domain: m.group_domain().to_string(),
                 ..Default::default()
             });
 
@@ -210,4 +265,24 @@ pub fn group_by_domain(messages: &[MessageMeta]) -> Vec<SenderGroup> {
     let mut groups: Vec<SenderGroup> = map.into_values().collect();
     groups.sort_by_key(|g| Reverse(g.count()));
     groups
+}
+
+#[cfg(test)]
+mod tests {
+    use super::registrable_domain;
+
+    #[test]
+    fn registrable_domain_collapses_subdomains() {
+        assert_eq!(registrable_domain("amazon.com"), "amazon.com");
+        assert_eq!(registrable_domain("mail.amazon.com"), "amazon.com");
+        assert_eq!(registrable_domain("a.b.c.amazon.com"), "amazon.com");
+        // Two-label public suffixes keep the registrable label.
+        assert_eq!(registrable_domain("news.bbc.co.uk"), "bbc.co.uk");
+        assert_eq!(registrable_domain("bbc.co.uk"), "bbc.co.uk");
+        assert_eq!(registrable_domain("shop.example.com.au"), "example.com.au");
+        // Short and degenerate inputs pass through unchanged.
+        assert_eq!(registrable_domain("localhost"), "localhost");
+        assert_eq!(registrable_domain("example.org"), "example.org");
+        assert_eq!(registrable_domain("trailing.dot.com."), "dot.com");
+    }
 }

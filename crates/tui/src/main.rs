@@ -49,6 +49,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
         "Switch view (All / Subscriptions / Attachments)",
     ),
     ("o", "Cycle sort (Messages / Size / Recent)"),
+    ("F", "Subscriptions: filter by unsub method"),
     ("/", "Search / filter the loaded list"),
     ("f", "Scan scope / query (Tab for examples)"),
     ("j / k", "Move down / up"),
@@ -56,6 +57,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("h / l", "Collapse / expand the tree"),
     ("Enter", "Open the selected message"),
     ("Space", "Mark / unmark the selection"),
+    ("*", "Select all visible (toggle)"),
     ("c", "Clear all selections"),
     ("a / A", "Archive / archive + delete"),
     ("d / s", "Trash / spam"),
@@ -326,6 +328,51 @@ impl View {
     }
 }
 
+/// Sub-filter for the Subscriptions view: which unsubscribe method to show.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubFilter {
+    All,
+    OneClick,
+    Web,
+    Email,
+}
+
+impl SubFilter {
+    const ALL: [SubFilter; 4] = [
+        SubFilter::All,
+        SubFilter::OneClick,
+        SubFilter::Web,
+        SubFilter::Email,
+    ];
+
+    fn index(self) -> usize {
+        SubFilter::ALL.iter().position(|f| *f == self).unwrap_or(0)
+    }
+
+    fn next(self) -> Self {
+        SubFilter::ALL[(self.index() + 1) % SubFilter::ALL.len()]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SubFilter::All => "all",
+            SubFilter::OneClick => "one-click",
+            SubFilter::Web => "web",
+            SubFilter::Email => "email",
+        }
+    }
+
+    /// Whether a message's unsubscribe handle passes this filter.
+    fn matches(self, info: &UnsubscribeInfo) -> bool {
+        match self {
+            SubFilter::All => true,
+            SubFilter::OneClick => info.one_click,
+            SubFilter::Web => info.http_url.is_some(),
+            SubFilter::Email => info.mailto.is_some(),
+        }
+    }
+}
+
 /// How the domain/sender/message tree is ordered.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SortMode {
@@ -413,11 +460,17 @@ struct App {
     /// Message IDs marked for a bulk action.
     marked: HashSet<String>,
     view: View,
+    /// Unsubscribe-method filter, applied in the Subscriptions view.
+    sub_filter: SubFilter,
     sort: SortMode,
     groups: Vec<DomainGroup>,
     expanded_domains: HashSet<String>,
     expanded_senders: HashSet<String>,
     selected: usize,
+    /// Scroll offset (first visible row) of the Domains list, persisted across
+    /// frames so the cursor floats within the viewport and only scrolls at the
+    /// edges.
+    domains_offset: usize,
     detail_scroll: u16,
     focus: Panel,
     sync: SyncState,
@@ -459,11 +512,13 @@ impl App {
             attachments: HashMap::new(),
             marked: HashSet::new(),
             view: View::All,
+            sub_filter: SubFilter::All,
             sort: SortMode::Messages,
             groups: Vec::new(),
             expanded_domains: HashSet::new(),
             expanded_senders: HashSet::new(),
             selected: 0,
+            domains_offset: 0,
             detail_scroll: 0,
             focus: Panel::Domains,
             sync: SyncState {
@@ -673,7 +728,13 @@ impl App {
             View::Subscriptions => self
                 .metas
                 .iter()
-                .filter(|m| m.list_unsubscribe.is_some())
+                .filter(|m| {
+                    mailsweep_core::unsubscribe::parse(
+                        m.list_unsubscribe.as_deref(),
+                        m.list_unsubscribe_post.as_deref(),
+                    )
+                    .is_some_and(|info| self.sub_filter.matches(&info))
+                })
                 .cloned()
                 .collect(),
             View::Attachments => self
@@ -930,6 +991,26 @@ impl App {
             }
         } else {
             self.marked.extend(ids);
+        }
+    }
+
+    /// Mark every message in the current view (all groups after the view,
+    /// search, and sub-filter are applied). Toggles: if everything visible is
+    /// already marked, clears that set instead. Returns a status message.
+    fn select_all_visible(&mut self) -> String {
+        let ids: Vec<String> = self.groups.iter().flat_map(|g| g.message_ids()).collect();
+        if ids.is_empty() {
+            return "Nothing to select".to_string();
+        }
+        if ids.iter().all(|id| self.marked.contains(id)) {
+            for id in &ids {
+                self.marked.remove(id);
+            }
+            format!("Unmarked {} visible message(s)", ids.len())
+        } else {
+            let n = ids.len();
+            self.marked.extend(ids);
+            format!("Marked {n} visible message(s)")
         }
     }
 
@@ -1846,6 +1927,21 @@ async fn handle_key(
         }
         KeyCode::Char('G') => app.goto_bottom(),
         KeyCode::Char(' ') => app.toggle_mark(),
+        KeyCode::Char('*') => {
+            let msg = app.select_all_visible();
+            app.notify(msg);
+        }
+        // Cycle the Subscriptions unsubscribe-method filter; jump to that view
+        // first if we're not already in it.
+        KeyCode::Char('F') => {
+            if app.view != View::Subscriptions {
+                app.set_view(View::Subscriptions);
+            } else {
+                app.sub_filter = app.sub_filter.next();
+                app.rebuild_groups();
+            }
+            app.notify(format!("Subscriptions filter: {}", app.sub_filter.label()));
+        }
         KeyCode::Char('o') => {
             app.sort = app.sort.next();
             app.rebuild_groups();
@@ -2227,7 +2323,7 @@ fn run_unsubscribe(
 
 // ---- rendering --------------------------------------------------------------
 
-fn ui(f: &mut Frame, app: &App) {
+fn ui(f: &mut Frame, app: &mut App) {
     // Top row sized for accounts + sync line, or the 4 Config rows — whichever
     // is taller (both inside a 2-line border).
     let top_height = ((app.accounts.len() as u16 + 3).max(CONFIG_ITEMS as u16 + 2)).min(14);
@@ -2685,7 +2781,7 @@ fn render_accounts(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn tabs_line(active: View) -> Line<'static> {
+fn tabs_line(active: View, sub_filter: SubFilter) -> Line<'static> {
     let mut spans = Vec::new();
     for (i, v) in View::ALL.iter().enumerate() {
         if i > 0 {
@@ -2698,12 +2794,18 @@ fn tabs_line(active: View) -> Line<'static> {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        spans.push(Span::styled(format!("[{}]", v.title()), style));
+        // Show the active unsubscribe-method filter on the Subscriptions tab.
+        let label = if *v == View::Subscriptions && sub_filter != SubFilter::All {
+            format!("[{}: {}]", v.title(), sub_filter.label())
+        } else {
+            format!("[{}]", v.title())
+        };
+        spans.push(Span::styled(label, style));
     }
     Line::from(spans)
 }
 
-fn render_domains(f: &mut Frame, app: &App, area: Rect) {
+fn render_domains(f: &mut Frame, app: &mut App, area: Rect) {
     let marked = if app.marked.is_empty() {
         String::new()
     } else {
@@ -2739,7 +2841,7 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
     constraints.push(Constraint::Min(1));
     let chunks = Layout::vertical(constraints).split(inner);
 
-    f.render_widget(Paragraph::new(tabs_line(app.view)), chunks[0]);
+    f.render_widget(Paragraph::new(tabs_line(app.view, app.sub_filter)), chunks[0]);
 
     let header = Line::from(Span::styled(
         format!(
@@ -2775,14 +2877,20 @@ fn render_domains(f: &mut Frame, app: &App, area: Rect) {
         .map(|r| ListItem::new(row_line(app, r)))
         .collect();
 
+    // Carry the previous scroll offset in so ratatui keeps the cursor floating
+    // within the viewport and only scrolls when it reaches an edge (rather than
+    // pinning the cursor and rolling the whole list). Persist the adjusted
+    // offset back for the next frame.
     let mut state = ListState::default();
     if !items.is_empty() {
+        *state.offset_mut() = app.domains_offset.min(items.len() - 1);
         state.select(Some(app.selected.min(items.len() - 1)));
     }
     let list = List::new(items)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("");
     f.render_stateful_widget(list, list_area, &mut state);
+    app.domains_offset = state.offset();
 }
 
 fn row_line(app: &App, row: &Row) -> Line<'static> {
@@ -3032,7 +3140,7 @@ fn overview_lines(app: &App) -> Vec<String> {
     lines.push(String::new());
 
     let total_size: u64 = app.metas.iter().map(|m| m.size_estimate).sum();
-    let domains: HashSet<&str> = app.metas.iter().map(|m| m.domain()).collect();
+    let domains: HashSet<&str> = app.metas.iter().map(|m| m.group_domain()).collect();
     let mut senders: HashMap<&str, (usize, u64)> = HashMap::new();
     for m in &app.metas {
         let e = senders.entry(m.from_email.as_str()).or_insert((0, 0));

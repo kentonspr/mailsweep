@@ -82,12 +82,13 @@ isn't available and attachment listing is skipped.
 | `1` `2` `3` `4` | Focus Accounts / Config / Domains / Details |
 | `Tab` / `Shift-Tab` | Switch view (All / Subscriptions / Attachments) |
 | `o` | Cycle sort (Messages / Size / Recent) |
+| `F` | Subscriptions: filter by unsubscribe method (all / one-click / web / email) |
 | `/` | Fuzzy-search the loaded list |
 | `f` | Server-side scan scope / query (`Tab` for examples) |
 | `j` `k` / arrows | Move (or scroll the focused panel) |
 | `h` `l` / arrows | Collapse / expand the tree |
 | `gg` / `G` | Jump to top / bottom |
-| `Space` / `c` | Mark / unmark · clear all marks |
+| `Space` / `*` / `c` | Mark / unmark · select all visible (toggle) · clear all marks |
 | `Enter` | Open the selected message |
 | `a` / `A` | Archive · archive **and** delete |
 | `d` / `s` / `r` | Trash · spam · mark read |
