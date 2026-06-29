@@ -24,7 +24,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 fs2 = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
+imap = "2"
+native-tls = "0.2"
 
 ratatui = "0.29"
 crossterm = "0.28"

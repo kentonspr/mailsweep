@@ -36,7 +36,7 @@ servers, no telemetry.
 | --- | --- |
 | **Gmail / Google Workspace** | Primary target; the most-exercised path |
 | **Outlook / Hotmail** (consumer, via Microsoft Graph) | Implemented but **experimental / untested** |
-| IMAP (Yahoo, iCloud, Fastmail, …) | Planned — hangs off the `MailProvider` trait |
+| **Generic IMAP** (Yahoo, iCloud, Fastmail, …) | Implemented but **experimental / untested** — no live account to verify against |
 
 ## Install
 
@@ -46,6 +46,13 @@ Build from source (needs a recent stable Rust toolchain):
 git clone <repo-url> mailsweep && cd mailsweep
 cargo run -p mailsweep-tui
 ```
+
+Linux, macOS, and Windows are all supported — the TUI runs in any modern
+terminal (Windows Terminal or a recent PowerShell on Windows; Terminal.app or
+iTerm2 on macOS). Building needs a C toolchain and a system TLS library for the
+bundled SQLite and the IMAP/`native-tls` dependency (on Windows the MSVC
+toolchain covers this; on macOS the Xcode command-line tools do). So far it has
+only been exercised on Linux.
 
 ## Setup
 
@@ -60,6 +67,13 @@ Then it's all in-app: launch, focus the **Config** panel (`2`), and pick
 **Set Gmail/Outlook credential** (paste the value/JSON or a path), then
 **+ Add Gmail/Outlook account** to sign in (browser for Gmail, device code for
 Outlook). Switch between accounts in the **Accounts** panel (`1`).
+
+**Generic IMAP** needs no pre-configured credential: pick **+ Add IMAP account**
+in the Config panel and fill in host, port, username, and password (use an
+app-specific password where the provider requires one). The connection is always
+encrypted: port `993` (the default) uses implicit TLS, port `143` uses STARTTLS.
+Mailsweep verifies the login before saving. IMAP is **experimental** — restore
+isn't available and attachment listing is skipped.
 
 ## Keys
 

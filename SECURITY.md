@@ -5,9 +5,10 @@ touches and where things live.
 
 ## No servers, no telemetry
 
-Mailsweep is a local program. It talks **directly** to your mail provider's API
-(Google / Microsoft) from your machine. There is no Mailsweep backend, no
-analytics, and no network traffic to anyone other than your provider.
+Mailsweep is a local program. It talks **directly** to your mail provider
+(Google / Microsoft APIs, or an IMAP server over TLS) from your machine. There
+is no Mailsweep backend, no analytics, and no network traffic to anyone other
+than your provider.
 
 ## Bring-your-own credentials
 
@@ -16,19 +17,29 @@ You register your **own** OAuth client (Google Cloud / Azure) and authorize your
 [`docs/gmail-setup.md`](docs/gmail-setup.md) and
 [`docs/outlook-setup.md`](docs/outlook-setup.md).
 
-## Scopes requested
+## Scopes & access
+
+Mailsweep **never permanently deletes** mail. Every "delete" moves messages to
+Trash (or Junk for spam), which your provider keeps recoverable for a while.
+This is intentional and consistent across providers, even where the API or
+protocol would allow a hard delete.
 
 - **Gmail:** `https://www.googleapis.com/auth/gmail.modify` — read, label, trash,
-  and mark messages. It **cannot permanently delete** mail; deletions go to
-  Trash and are reversible.
+  and mark messages. It can't expunge at all; Mailsweep deliberately does not
+  request the broader `https://mail.google.com/` scope.
 - **Outlook (Microsoft Graph):** `Mail.ReadWrite`, `User.Read`, `offline_access`.
+  Mailsweep only ever moves messages to Deleted Items.
+- **Generic IMAP:** Mailsweep authenticates with the username/password you
+  supply and only moves messages to the Trash folder (it never sets `\Deleted`
+  / expunges). Prefer an app-specific password where the provider offers one.
 
 ## Where data is stored
 
 - **Config** — `~/.config/mailsweep/`: your OAuth client credentials
   (`client_secret.json`, `ms_client_id`).
 - **Data** — `~/.local/share/mailsweep/`:
-  - `accounts/<email>/token.json` — OAuth refresh/access tokens.
+  - `accounts/<email>/token.json` — OAuth refresh/access tokens, or for IMAP
+    accounts the connection settings **including the password in plaintext**.
   - `accounts/<email>/metadata.sqlite3` — a local cache of message headers,
     attachment metadata, and the sync checkpoint.
   - `archives/` — zip archives you create.

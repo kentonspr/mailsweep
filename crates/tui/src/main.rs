@@ -31,6 +31,7 @@ use tokio::time::sleep;
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use mailsweep_core::imap::ImapClient;
 use mailsweep_core::outlook::{MsAuth, OutlookClient};
 use mailsweep_core::{
     accounts, archive_messages, config, group_messages, ArchiveItem, ArchiveScope, AttachmentInfo,
@@ -60,20 +61,21 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("d / s", "Trash / spam"),
     ("r", "Mark read"),
     ("u / U", "Unsubscribe / unsubscribe + delete"),
-    ("X", "Permanently delete (not on Gmail)"),
     ("z", "Undo last delete"),
     ("O", "Overview / stats"),
     ("?", "Show this help"),
     ("q", "Quit"),
 ];
 
-/// Config panel rows: set Gmail cred, set Outlook cred, add Gmail, add Outlook.
-const CONFIG_ITEMS: usize = 4;
+/// Config panel rows: set Gmail cred, set Outlook cred, add Gmail, add Outlook,
+/// add IMAP.
+const CONFIG_ITEMS: usize = 5;
 const CONFIG_LABELS: [&str; CONFIG_ITEMS] = [
     "Set Gmail credential",
     "Set Outlook credential",
     "+ Add Gmail account",
     "+ Add Outlook account",
+    "+ Add IMAP account (experimental)",
 ];
 
 /// Messages streamed from the background scan / archive tasks into the UI.
@@ -133,6 +135,8 @@ enum KeyOutcome {
     Switch(usize),
     AddAccount(accounts::Provider),
     StartAuth(accounts::Provider),
+    /// Add a generic IMAP account: (host, port, username, password).
+    AddImap(String, u16, String, String),
     ConfirmRun,
     Rescan,
 }
@@ -143,6 +147,14 @@ enum Panel {
     Config,
     Domains,
     Details,
+}
+
+impl Panel {
+    /// The message panels (the view tabs and the message tree live here). Keys
+    /// that act on the message view only apply when one of these is focused.
+    fn is_content(self) -> bool {
+        matches!(self, Panel::Domains | Panel::Details)
+    }
 }
 
 /// Add-account wizard overlay.
@@ -184,7 +196,20 @@ enum ModalState {
         examples: Vec<(String, String)>,
         expanded: bool,
     },
+    /// Multi-field form for adding a generic IMAP account.
+    ImapForm {
+        host: String,
+        port: String,
+        username: String,
+        password: String,
+        /// 0=host, 1=port, 2=username, 3=password.
+        field: usize,
+        error: Option<String>,
+    },
 }
+
+/// Number of editable fields in [`ModalState::ImapForm`].
+const IMAP_FIELDS: usize = 4;
 
 impl Modal {
     fn credential(provider: accounts::Provider, then_auth: bool) -> Self {
@@ -252,6 +277,19 @@ impl Modal {
                 help,
                 examples,
                 expanded: false,
+            },
+        }
+    }
+
+    fn imap_form() -> Self {
+        Modal {
+            state: ModalState::ImapForm {
+                host: String::new(),
+                port: "993".to_string(),
+                username: String::new(),
+                password: String::new(),
+                field: 0,
+                error: None,
             },
         }
     }
@@ -501,6 +539,10 @@ impl App {
             }
             2 => KeyOutcome::AddAccount(accounts::Provider::Gmail),
             3 => KeyOutcome::AddAccount(accounts::Provider::Outlook),
+            4 => {
+                self.modal = Some(Modal::imap_form());
+                KeyOutcome::None
+            }
             _ => KeyOutcome::None,
         }
     }
@@ -918,6 +960,33 @@ impl App {
         }
     }
 
+    /// Gather the unsubscribe targets for the current action: the distinct
+    /// unsubscribe handles plus the message IDs they cover. Uses the marked set
+    /// if any, otherwise the selected node. For the marked set, every sender
+    /// that has an unsubscribe handle and at least one marked message
+    /// contributes (deduped by URL/mailto).
+    fn unsub_action(&self) -> (Vec<UnsubscribeInfo>, Vec<String>, String) {
+        if self.marked.is_empty() {
+            return match self.target() {
+                Some(t) => (t.unsubscribe.into_iter().collect(), t.ids, t.label),
+                None => (Vec::new(), Vec::new(), String::new()),
+            };
+        }
+        let ids: Vec<String> = self.marked.iter().cloned().collect();
+        let mut infos = Vec::new();
+        let mut seen: HashSet<(Option<String>, Option<String>)> = HashSet::new();
+        for g in &self.groups {
+            for s in &g.senders {
+                let Some(u) = &s.unsubscribe else { continue };
+                let has_marked = s.messages.iter().any(|m| self.marked.contains(&m.id));
+                if has_marked && seen.insert((u.http_url.clone(), u.mailto.clone())) {
+                    infos.push(u.clone());
+                }
+            }
+        }
+        (infos, ids, format!("{} marked", self.marked.len()))
+    }
+
     /// Collect archivable messages (those with attachments) for the marked set,
     /// or — if nothing is marked — under the current selection.
     fn archive_items(&self) -> Vec<ArchiveItem> {
@@ -1031,6 +1100,10 @@ fn build_account(account: &accounts::Account) -> Result<AccountCtx> {
                 .context("set MAILSWEEP_MS_CLIENT_ID to your Azure app id for Outlook")?;
             let auth = MsAuth::new(client_id, accounts::token_path(&email));
             Arc::new(OutlookClient::new(Arc::new(auth)).with_cache(cache.clone()))
+        }
+        accounts::Provider::Imap => {
+            let cfg = accounts::load_imap_config(&email)?;
+            Arc::new(ImapClient::new(cfg).with_cache(cache.clone()))
         }
     };
     Ok(AccountCtx {
@@ -1372,6 +1445,9 @@ async fn event_loop<B: Backend + io::Write>(
                         app.modal = Some(Modal::working(provider));
                         start_auth(provider, tx);
                     }
+                    KeyOutcome::AddImap(host, port, username, password) => {
+                        start_imap(host, port, username, password, tx);
+                    }
                     KeyOutcome::ConfirmRun => {
                         app.modal = None;
                         if let Some(pending) = app.pending.take() {
@@ -1395,7 +1471,26 @@ fn provider_configured(provider: accounts::Provider) -> bool {
     match provider {
         accounts::Provider::Gmail => config::gmail_configured(),
         accounts::Provider::Outlook => config::outlook_configured(),
+        // IMAP carries its own credentials; nothing to pre-configure.
+        accounts::Provider::Imap => true,
     }
+}
+
+/// Spawn the background IMAP add-account task; the result flows back as `AuthDone`.
+fn start_imap(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    tx: &UnboundedSender<(u64, ScanEvent)>,
+) {
+    let done_tx = tx.clone();
+    tokio::spawn(async move {
+        let res = accounts::add_imap(host, port, username, password)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = done_tx.send((0, ScanEvent::AuthDone(accounts::Provider::Imap, res)));
+    });
 }
 
 /// Spawn the background sign-in task; prompts/result flow back over the channel.
@@ -1475,6 +1570,7 @@ fn save_cred(provider: accounts::Provider, input: &str) -> Result<()> {
     match provider {
         accounts::Provider::Gmail => config::save_gmail_secret(input),
         accounts::Provider::Outlook => config::save_ms_client_id(input),
+        accounts::Provider::Imap => anyhow::bail!("IMAP accounts don't use a shared credential"),
     }
 }
 
@@ -1487,6 +1583,7 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
         StartAuth(accounts::Provider),
         ConfirmRun,
         SetScope(Option<String>),
+        SubmitImap(String, u16, String, String),
     }
 
     let act = {
@@ -1577,6 +1674,75 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
                 }
                 _ => Act::None,
             },
+            ModalState::ImapForm {
+                host,
+                port,
+                username,
+                password,
+                field,
+                error,
+            } => match code {
+                KeyCode::Esc => Act::Close,
+                KeyCode::Tab | KeyCode::Down => {
+                    *field = (*field + 1) % IMAP_FIELDS;
+                    Act::None
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    *field = (*field + IMAP_FIELDS - 1) % IMAP_FIELDS;
+                    Act::None
+                }
+                KeyCode::Enter => {
+                    if *field < IMAP_FIELDS - 1 {
+                        *field += 1;
+                        Act::None
+                    } else {
+                        let port_num: Option<u16> = port.trim().parse().ok();
+                        if host.trim().is_empty() {
+                            *error = Some("Host is required".to_string());
+                            Act::None
+                        } else if username.trim().is_empty() {
+                            *error = Some("Username is required".to_string());
+                            Act::None
+                        } else if password.is_empty() {
+                            *error = Some("Password is required".to_string());
+                            Act::None
+                        } else if port_num.is_none() {
+                            *error = Some("Port must be a number".to_string());
+                            Act::None
+                        } else {
+                            Act::SubmitImap(
+                                host.trim().to_string(),
+                                port_num.unwrap(),
+                                username.trim().to_string(),
+                                password.clone(),
+                            )
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    let target = match *field {
+                        0 => host,
+                        1 => port,
+                        2 => username,
+                        _ => password,
+                    };
+                    target.pop();
+                    *error = None;
+                    Act::None
+                }
+                KeyCode::Char(c) => {
+                    let target = match *field {
+                        0 => host,
+                        1 => port,
+                        2 => username,
+                        _ => password,
+                    };
+                    target.push(c);
+                    *error = None;
+                    Act::None
+                }
+                _ => Act::None,
+            },
         }
     };
 
@@ -1597,6 +1763,16 @@ fn modal_key(app: &mut App, code: KeyCode) -> KeyOutcome {
             app.scope_query = scope;
             app.modal = None;
             KeyOutcome::Rescan
+        }
+        Act::SubmitImap(host, port, username, password) => {
+            app.modal = Some(Modal::working(accounts::Provider::Imap));
+            if let Some(Modal {
+                state: ModalState::Working { lines, .. },
+            }) = &mut app.modal
+            {
+                *lines = vec![format!("Connecting to {host}…")];
+            }
+            KeyOutcome::AddImap(host, port, username, password)
         }
     }
 }
@@ -1654,10 +1830,11 @@ async fn handle_key(
                 examples,
             ));
         }
-        KeyCode::Tab => app.set_view(app.view.next()),
-        KeyCode::BackTab => app.set_view(app.view.prev()),
-        KeyCode::Char('l') | KeyCode::Right => app.expand(),
-        KeyCode::Char('h') | KeyCode::Left => app.collapse(),
+        // View tabs and tree expand/collapse only apply to the message panels.
+        KeyCode::Tab if app.focus.is_content() => app.set_view(app.view.next()),
+        KeyCode::BackTab if app.focus.is_content() => app.set_view(app.view.prev()),
+        KeyCode::Char('l') | KeyCode::Right if app.focus.is_content() => app.expand(),
+        KeyCode::Char('h') | KeyCode::Left if app.focus.is_content() => app.collapse(),
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
         KeyCode::Char('g') => {
@@ -1696,7 +1873,6 @@ async fn handle_key(
         KeyCode::Char('d') => act(app, provider, em, Action::Trash),
         KeyCode::Char('s') => act(app, provider, em, Action::Spam),
         KeyCode::Char('r') => act(app, provider, em, Action::Read),
-        KeyCode::Char('X') => act(app, provider, em, Action::PermanentDelete),
         KeyCode::Char('z') => undo_last(app, provider, em),
         KeyCode::Char('u') => unsubscribe(app, provider, em, false),
         KeyCode::Char('U') => unsubscribe(app, provider, em, true),
@@ -1816,7 +1992,6 @@ enum Action {
     Trash,
     Spam,
     Read,
-    PermanentDelete,
 }
 
 impl Action {
@@ -1825,7 +2000,6 @@ impl Action {
             Action::Trash => "Trashing",
             Action::Spam => "Marking as spam",
             Action::Read => "Marking read",
-            Action::PermanentDelete => "Permanently deleting",
         }
     }
     fn past(self) -> &'static str {
@@ -1833,7 +2007,6 @@ impl Action {
             Action::Trash => "Trashed",
             Action::Spam => "Marked as spam",
             Action::Read => "Marked read",
-            Action::PermanentDelete => "Permanently deleted",
         }
     }
     fn confirm_verb(self) -> &'static str {
@@ -1841,16 +2014,11 @@ impl Action {
             Action::Trash => "Trash",
             Action::Spam => "Mark as spam",
             Action::Read => "Mark read",
-            Action::PermanentDelete => "PERMANENTLY DELETE (irreversible)",
         }
     }
     /// Whether the action removes messages from the inbox.
     fn removes(self) -> bool {
-        matches!(self, Action::Trash | Action::Spam | Action::PermanentDelete)
-    }
-    /// Always confirm, regardless of count (irreversible).
-    fn always_confirm(self) -> bool {
-        matches!(self, Action::PermanentDelete)
+        matches!(self, Action::Trash | Action::Spam)
     }
 }
 
@@ -1858,7 +2026,7 @@ impl Action {
 enum Pending {
     Act(Action, Vec<String>, String),
     Archive(Vec<ArchiveItem>, bool),
-    UnsubDelete(UnsubscribeInfo, Vec<String>, String),
+    UnsubDelete(Vec<UnsubscribeInfo>, Vec<String>, String),
 }
 
 /// The most recent removal, for one level of undo.
@@ -1871,8 +2039,8 @@ fn run_pending(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, pe
     match pending {
         Pending::Act(a, ids, label) => run_act(app, provider, em, a, ids, label),
         Pending::Archive(items, del) => run_archive(app, provider, em, items, del),
-        Pending::UnsubDelete(info, ids, label) => {
-            run_unsubscribe(app, provider, em, info, ids, label, true)
+        Pending::UnsubDelete(infos, ids, label) => {
+            run_unsubscribe(app, provider, em, infos, ids, label, true)
         }
     }
 }
@@ -1884,7 +2052,7 @@ fn act(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, action: Ac
     if ids.is_empty() {
         return;
     }
-    if action.always_confirm() || (action.removes() && ids.len() > CONFIRM_THRESHOLD) {
+    if action.removes() && ids.len() > CONFIRM_THRESHOLD {
         let prompt = format!(
             "{} {} message(s) from {label}?",
             action.confirm_verb(),
@@ -1915,7 +2083,6 @@ fn run_act(
             Action::Trash => provider.trash(&ids).await,
             Action::Spam => provider.mark_spam(&ids).await,
             Action::Read => provider.mark_read(&ids).await,
-            Action::PermanentDelete => provider.permanent_delete(&ids).await,
         };
         match result {
             Ok(()) => {
@@ -1963,85 +2130,99 @@ fn undo_last(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter) {
 /// One-click POST and the (optional) trash run in the background; opening a
 /// web/mail link is instant and done inline.
 fn unsubscribe(app: &mut App, provider: &Arc<dyn MailProvider>, em: &Emitter, delete_after: bool) {
-    let Some(target) = app.target() else {
+    let (infos, ids, label) = app.unsub_action();
+    if ids.is_empty() {
         app.notify("Nothing selected");
         return;
-    };
-    let Some(info) = target.unsubscribe.clone() else {
-        app.notify(format!("No unsubscribe info for {}", target.label));
+    }
+    if infos.is_empty() {
+        app.notify(format!("No unsubscribe info for {label}"));
         return;
-    };
-    let label = target.label.clone();
-    let ids = target.ids.clone();
+    }
 
     if delete_after && ids.len() > CONFIRM_THRESHOLD {
         let prompt = format!(
             "Unsubscribe and delete {} message(s) from {label}?",
             ids.len()
         );
-        app.pending = Some(Pending::UnsubDelete(info, ids, label));
+        app.pending = Some(Pending::UnsubDelete(infos, ids, label));
         app.modal = Some(Modal::confirm(prompt));
         return;
     }
-    run_unsubscribe(app, provider, em, info, ids, label, delete_after);
+    run_unsubscribe(app, provider, em, infos, ids, label, delete_after);
 }
 
 fn run_unsubscribe(
     app: &mut App,
     provider: &Arc<dyn MailProvider>,
     em: &Emitter,
-    info: UnsubscribeInfo,
+    infos: Vec<UnsubscribeInfo>,
     ids: Vec<String>,
     label: String,
     delete_after: bool,
 ) {
-    // Manual (non-one-click) methods open immediately.
-    if !info.one_click {
+    // Manual (non-one-click) methods open immediately, one per distinct sender.
+    for info in infos.iter().filter(|i| !i.one_click) {
         if info.http_url.is_some() {
-            let _ = mailsweep_core::unsubscribe::open_in_browser(&info);
+            let _ = mailsweep_core::unsubscribe::open_in_browser(info);
             app.notify(format!("Opened unsubscribe page for {label}"));
         } else if let Some(mailto) = &info.mailto {
             app.notify(format!("Unsubscribe by emailing: {mailto}"));
-        } else {
-            app.notify(format!("No usable unsubscribe method for {label}"));
         }
     }
 
-    // Background: the one-click POST and/or the trash.
-    if info.one_click || delete_after {
-        if info.one_click {
-            app.notify(format!("Unsubscribing from {label}…"));
-        }
-        if delete_after {
-            app.notify(format!("Deleting {} message(s) from {label}…", ids.len()));
-        }
-        app.pending_ops += 1;
-        let provider = provider.clone();
-        let em = em.clone();
-        tokio::spawn(async move {
-            if info.one_click {
-                let msg = match provider.unsubscribe_one_click(&info).await {
-                    Ok(true) => format!("Unsubscribed from {label} (one-click)"),
-                    Ok(false) => format!("One-click unsubscribe not accepted for {label}"),
-                    Err(e) => format!("Unsubscribe failed: {e}"),
-                };
-                em.send(ScanEvent::Notice(msg));
-            }
-            if delete_after {
-                match provider.trash(&ids).await {
-                    Ok(()) => {
-                        em.send(ScanEvent::Removed(ids.clone()));
-                        em.send(ScanEvent::Notice(format!(
-                            "Trashed {} message(s) from {label}",
-                            ids.len()
-                        )));
-                    }
-                    Err(e) => em.send(ScanEvent::Notice(format!("Trash failed: {e}"))),
+    let one_click: Vec<UnsubscribeInfo> = infos.into_iter().filter(|i| i.one_click).collect();
+    if one_click.is_empty() && !delete_after {
+        return;
+    }
+
+    // Background: the one-click POST(s) and/or the trash.
+    if !one_click.is_empty() {
+        app.notify(format!("Unsubscribing from {label}…"));
+    }
+    if delete_after {
+        app.notify(format!("Deleting {} message(s) from {label}…", ids.len()));
+    }
+    app.pending_ops += 1;
+    let provider = provider.clone();
+    let em = em.clone();
+    tokio::spawn(async move {
+        if !one_click.is_empty() {
+            let total = one_click.len();
+            let mut ok = 0usize;
+            let mut last_err = None;
+            for info in &one_click {
+                match provider.unsubscribe_one_click(info).await {
+                    Ok(true) => ok += 1,
+                    Ok(false) => {}
+                    Err(e) => last_err = Some(e.to_string()),
                 }
             }
-            em.send(ScanEvent::OpDone);
-        });
-    }
+            let msg = if total == 1 {
+                match (ok, &last_err) {
+                    (1, _) => format!("Unsubscribed from {label} (one-click)"),
+                    (_, Some(e)) => format!("Unsubscribe failed: {e}"),
+                    _ => format!("One-click unsubscribe not accepted for {label}"),
+                }
+            } else {
+                format!("Unsubscribed from {ok}/{total} sender(s) for {label}")
+            };
+            em.send(ScanEvent::Notice(msg));
+        }
+        if delete_after {
+            match provider.trash(&ids).await {
+                Ok(()) => {
+                    em.send(ScanEvent::Removed(ids.clone()));
+                    em.send(ScanEvent::Notice(format!(
+                        "Trashed {} message(s) from {label}",
+                        ids.len()
+                    )));
+                }
+                Err(e) => em.send(ScanEvent::Notice(format!("Trash failed: {e}"))),
+            }
+        }
+        em.send(ScanEvent::OpDone);
+    });
 }
 
 // ---- rendering --------------------------------------------------------------
@@ -2315,6 +2496,7 @@ fn render_modal(f: &mut Frame, modal: &Modal) {
                 accounts::Provider::Outlook => {
                     "Paste your Azure app (client) id, or a path to a file with it:"
                 }
+                accounts::Provider::Imap => "",
             };
             let mut lines = vec![
                 Line::from(format!("Set {} credential", provider.label())),
@@ -2377,6 +2559,52 @@ fn render_modal(f: &mut Frame, modal: &Modal) {
                 )),
             ],
         ),
+        ModalState::ImapForm {
+            host,
+            port,
+            username,
+            password,
+            field,
+            error,
+        } => {
+            let labels = ["Host", "Port", "Username", "Password"];
+            let masked = "*".repeat(password.chars().count());
+            let values = [host.as_str(), port.as_str(), username.as_str(), masked.as_str()];
+            let mut lines = vec![
+                Line::from("Add a generic IMAP account"),
+                Line::from(Span::styled(
+                    "Experimental — untested against live servers.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+            ];
+            for (i, (label, value)) in labels.iter().zip(values.iter()).enumerate() {
+                let active = i == *field;
+                let marker = if active { "> " } else { "  " };
+                let style = if active {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{marker}{label:<9} {value}"),
+                    style,
+                )));
+            }
+            if let Some(e) = error {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    e.clone(),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Tab/↑↓ move · Enter next/submit · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            ("Add IMAP account", lines)
+        }
     };
 
     let block = Block::default()

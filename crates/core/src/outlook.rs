@@ -561,27 +561,6 @@ impl MailProvider for OutlookClient {
         Ok(())
     }
 
-    async fn permanent_delete(&self, ids: &[String]) -> Result<()> {
-        for chunk in ids.chunks(BATCH_LIMIT) {
-            let requests: Vec<serde_json::Value> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, id)| {
-                    serde_json::json!({
-                        "id": i.to_string(),
-                        "method": "POST",
-                        "url": format!("/me/messages/{id}/permanentDelete"),
-                    })
-                })
-                .collect();
-            self.batch(requests).await?;
-        }
-        if let Some(cache) = &self.cache {
-            cache.remove(ids).await.ok();
-        }
-        Ok(())
-    }
-
     async fn unsubscribe_one_click(&self, info: &UnsubscribeInfo) -> Result<bool> {
         crate::unsubscribe::one_click(&self.http, info).await
     }

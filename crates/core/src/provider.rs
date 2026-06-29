@@ -68,10 +68,6 @@ pub trait MailProvider: Send + Sync {
     /// Restore messages to the inbox (undo a trash/spam).
     async fn restore(&self, ids: &[String]) -> Result<()>;
 
-    /// Permanently delete messages (irreversible). Not all providers support
-    /// this under the scopes Mailsweep requests.
-    async fn permanent_delete(&self, ids: &[String]) -> Result<()>;
-
     /// Perform a one-click (RFC 8058) unsubscribe; `Ok(true)` on success.
     async fn unsubscribe_one_click(&self, info: &UnsubscribeInfo) -> Result<bool>;
 

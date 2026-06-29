@@ -20,6 +20,7 @@ use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 use crate::auth::{AuthPrompt, GmailAuth};
 use crate::config;
 use crate::gmail::GmailClient;
+use crate::imap::{self, ImapConfig};
 use crate::outlook::{MsAuth, OutlookClient};
 use crate::provider::MailProvider;
 
@@ -30,6 +31,7 @@ pub type PromptFn = Arc<dyn Fn(AuthPrompt) + Send + Sync>;
 pub enum Provider {
     Gmail,
     Outlook,
+    Imap,
 }
 
 impl Provider {
@@ -37,6 +39,7 @@ impl Provider {
         match self {
             Provider::Gmail => "gmail",
             Provider::Outlook => "outlook",
+            Provider::Imap => "imap",
         }
     }
 
@@ -44,12 +47,14 @@ impl Provider {
         match self {
             Provider::Gmail => "Gmail",
             Provider::Outlook => "Outlook",
+            Provider::Imap => "IMAP",
         }
     }
 
     fn parse(s: &str) -> Provider {
         match s.trim() {
             "outlook" => Provider::Outlook,
+            "imap" => Provider::Imap,
             _ => Provider::Gmail,
         }
     }
@@ -185,11 +190,53 @@ pub async fn add_account(provider: Provider, on_prompt: PromptFn) -> Result<Stri
             auth.device_login(on_prompt.as_ref()).await?;
             OutlookClient::new(Arc::new(auth)).profile().await?.email
         }
+        Provider::Imap => {
+            anyhow::bail!("use add_imap() to add an IMAP account")
+        }
     };
 
     persist_account(&email, provider, &pending_token)?;
     let _ = std::fs::remove_dir_all(&pending);
     Ok(email)
+}
+
+/// Add a generic IMAP account. Verifies the credentials by logging in, then
+/// persists the connection settings as the account's `token.json`. The username
+/// doubles as the account email. **Experimental** — not tested against a live
+/// server.
+pub async fn add_imap(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+) -> Result<String> {
+    let cfg = ImapConfig {
+        host,
+        port,
+        username: username.clone(),
+        password,
+    };
+    let verify_cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || imap::verify(&verify_cfg))
+        .await
+        .context("IMAP verify task panicked")??;
+
+    let email = username;
+    let dir = account_dir(&email);
+    std::fs::create_dir_all(&dir)?;
+    let json = serde_json::to_string_pretty(&cfg)?;
+    std::fs::write(token_path(&email), json)?;
+    std::fs::write(dir.join("email"), &email)?;
+    std::fs::write(dir.join("provider"), Provider::Imap.as_str())?;
+    Ok(email)
+}
+
+/// Load the stored IMAP connection settings for an account.
+pub fn load_imap_config(email: &str) -> Result<ImapConfig> {
+    let json = std::fs::read_to_string(token_path(email))
+        .with_context(|| format!("reading IMAP settings for {email}"))?;
+    let cfg: ImapConfig = serde_json::from_str(&json).context("parsing IMAP settings")?;
+    Ok(cfg)
 }
 
 /// If no accounts exist but a legacy single-account Gmail token cache is
